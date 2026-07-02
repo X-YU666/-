@@ -61,6 +61,49 @@ void vc_merge(VectorClock *dst, const VectorClock *a, const VectorClock *b) {
             vc_set(dst, b->comps[i].node_id, b->comps[i].counter);
     }
 }
+void vc_receive(VectorClock* vc, const VectorClock* incoming, const char* own_node) {
+    VectorClock merged;
+    vc_merge(&merged, vc, incoming);
+    *vc = merged;
+    vc_increment(vc, own_node);
+}
+
+VCOrder vc_compare(const VectorClock* a, const VectorClock* b) {
+    bool a_le_b = true, b_le_a = true;
+
+    /* 收集 a 和 b 中所有出现过的节点 */
+    char all_nodes[VC_MAX_NODES][VC_NODE_ID_LEN];
+    int all_count = 0;
+    for (int i = 0; i < a->count; i++) {
+        strncpy(all_nodes[all_count], a->comps[i].node_id, VC_NODE_ID_LEN);
+        all_count++;
+    }
+    for (int i = 0; i < b->count; i++) {
+        bool found = false;
+        for (int j = 0; j < all_count; j++) {
+            if (strcmp(all_nodes[j], b->comps[i].node_id) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found && all_count < VC_MAX_NODES) {
+            strncpy(all_nodes[all_count], b->comps[i].node_id, VC_NODE_ID_LEN);
+            all_count++;
+        }
+    }
+
+    for (int i = 0; i < all_count; i++) {
+        int va = vc_get(a, all_nodes[i]);
+        int vb = vc_get(b, all_nodes[i]);
+        if (va > vb) a_le_b = false;
+        if (vb > va) b_le_a = false;
+    }
+
+    if (a_le_b && b_le_a) return VC_EQUAL;
+    if (a_le_b)          return VC_BEFORE;
+    if (b_le_a)          return VC_AFTER;
+    return VC_CONCURRENT;
+}
 
 
 const char *vc_order_str(VCOrder o) {
