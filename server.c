@@ -1,14 +1,34 @@
 /*
- * server.c v2 — 异步连接 + 主循环框架
- * 新增：OVERLAPPED 异步 ConnectNamedPipe + WaitForMultipleObjects
- *       主循环就绪（还没有 Pipe 工作线程）
+ * server.c v3 — 工作线程：读取 Pipe + 显示收到的消息
+ * 新增：CreateThread 工作线程逐行 ReadFile 打印原始消息
+ *       主循环续接下一个 Agent 连接
  * 用法: server.exe [管道名]
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 
 static volatile LONG g_running = 1;
+
+typedef struct { HANDLE pipe; } ClientCtx;
+
+static DWORD WINAPI pipe_thread(LPVOID arg) {
+    ClientCtx *ctx = (ClientCtx *)arg;
+    char buf[1024];
+    while (g_running) {
+        DWORD n;
+        if (!ReadFile(ctx->pipe, buf, sizeof(buf), &n, NULL) || n == 0)
+            break;
+        buf[n] = 0;
+        printf("\n[收到] %s", buf);
+        printf("[server] > "); fflush(stdout);
+    }
+    DisconnectNamedPipe(ctx->pipe);
+    CloseHandle(ctx->pipe);
+    free(ctx);
+    return 0;
+}
 
 static void cmd(const char *c) {
     if (strcmp(c, "exit") == 0) {
@@ -53,13 +73,11 @@ int main(int argc, char *argv[]) {
     const char *pn = argc > 1 ? argv[1] : "\\\\.\\pipe\\vc_log_agg";
 
     printf("+------------------------------------------+\n");
-    printf("| 向量时钟分布式日志聚合服务器 v2           |\n");
-    printf("| 新增：异步连接 + 主循环框架               |\n");
+    printf("| 向量时钟分布式日志聚合服务器 v3           |\n");
+    printf("| 新增：工作线程 + 续接下一个 Agent         |\n");
     printf("+------------------------------------------+\n");
-    printf("管道: %s\n", pn);
     printf("等待 Agent 连接...\n\n[server] > "); fflush(stdout);
 
-    /* v2: OVERLAPPED 异步连接 */
     HANDLE hPipe = CreateNamedPipeA(pn, PIPE_ACCESS_INBOUND,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, NULL);
@@ -72,16 +90,28 @@ int main(int argc, char *argv[]) {
     if (cp || GetLastError() == ERROR_PIPE_CONNECTED) SetEvent(ov.hEvent);
     else if (GetLastError() != ERROR_IO_PENDING) return 1;
 
-    /* v2: 主循环 */
     while (g_running) {
         HANDLE w[2] = { ov.hEvent, GetStdHandle(STD_INPUT_HANDLE) };
         DWORD wr = WaitForMultipleObjects(2, w, FALSE, 200);
 
         if (wr == WAIT_OBJECT_0) {
-            printf("Agent 已连接!\n[server] > ");
-            fflush(stdout);
-            /* 后续版本会增加工作线程 */
-            break;
+            /* v3: 启动工作线程处理已连接的 Agent */
+            ClientCtx *ctx = malloc(sizeof(ClientCtx));
+            ctx->pipe = hPipe;
+            CreateThread(NULL, 0, pipe_thread, ctx, 0, NULL);
+
+            /* 创建下一个管道实例，继续等待新的 Agent */
+            hPipe = CreateNamedPipeA(pn, PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                PIPE_UNLIMITED_INSTANCES, 4096, 4096, 0, NULL);
+            if (hPipe == INVALID_HANDLE_VALUE) break;
+
+            CloseHandle(ov.hEvent);
+            ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+            cp = ConnectNamedPipe(hPipe, &ov);
+            if (cp || GetLastError() == ERROR_PIPE_CONNECTED) SetEvent(ov.hEvent);
+            else if (GetLastError() != ERROR_IO_PENDING) break;
+            continue;
         }
 
         HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
