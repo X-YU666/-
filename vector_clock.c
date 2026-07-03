@@ -112,8 +112,6 @@ const char *vc_order_str(VCOrder o) {
     }
 }
 
-/* ======== v3 新增 ======== */
-
 int vc_to_json(const VectorClock *vc, char *buf, int buf_size) {
     int pos = 0;
     pos += snprintf(buf + pos, buf_size - pos, "{");
@@ -175,24 +173,20 @@ int main(void) {
     vc_init(&a);
     vc_init(&b);
 
-    /* A 发生 3 个事件 */
     vc_increment(&a, "A");
     vc_increment(&a, "A");
     vc_increment(&a, "A");
     printf("A after 3 events: "); vc_print(&a); printf("\n");
 
-    /* B 发生 1 个事件 */
     vc_increment(&b, "B");
     printf("B after 1 event:  "); vc_print(&b); printf("\n");
 
-    /* B 收到 A 的消息 (vc={'A':2}) */
     VectorClock a2;
     vc_init(&a2);
     vc_set(&a2, "A", 2);
     vc_receive(&b, &a2, "B");
     printf("B after recv A:2: "); vc_print(&b); printf("\n");
 
-    /* 比较 */
     printf("a vs b: %s\n", vc_order_str(vc_compare(&a, &b)));
 
     printf("All tests passed!\n");
