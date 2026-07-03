@@ -1,12 +1,13 @@
 /*
- * vector_clock.c — 向量时钟 v2：加入分布式通信与因果序 (v2)
+ * vector_clock.c — 向量时钟 v3：加入 JSON 序列化与自测 (v3)
  *
  * v1: init / get / set / increment
  * v2: + merge / receive / compare / order_str
+ * v3: + to_json / from_json / print / 独立测试 main
  *
- * merge: 逐分量取最大值，合并两个向量时钟
- * receive: merge 之后自增自身分量（happened-before 的关键）
- * compare: 判断两个时钟的因果关系（before/after/concurrent/equal）
+ * JSON 序列化使向量时钟可以通过网络传输（Agent→Server）。
+ * vc_print 方便调试查看时钟状态。
+ * 编译时加 -DVECTOR_CLOCK_TEST 可独立运行自测。
  */
 #include "vector_clock.h"
 #include <stdio.h>
@@ -45,33 +46,29 @@ void vc_increment(VectorClock *vc, const char *own_node) {
     vc_set(vc, own_node, val + 1);
 }
 
-/* ======== v2 新增 ======== */
-
 void vc_merge(VectorClock *dst, const VectorClock *a, const VectorClock *b) {
     vc_init(dst);
-    /* 遍历 a，逐分量与 b 取最大值 */
     for (int i = 0; i < a->count; i++) {
         int vb = vc_get(b, a->comps[i].node_id);
         int mx = a->comps[i].counter > vb ? a->comps[i].counter : vb;
         vc_set(dst, a->comps[i].node_id, mx);
     }
-    /* 补上 b 中有而 a 中没有的分量 */
     for (int i = 0; i < b->count; i++) {
         if (vc_get(a, b->comps[i].node_id) == 0)
             vc_set(dst, b->comps[i].node_id, b->comps[i].counter);
     }
 }
-void vc_receive(VectorClock* vc, const VectorClock* incoming, const char* own_node) {
+
+void vc_receive(VectorClock *vc, const VectorClock *incoming, const char *own_node) {
     VectorClock merged;
     vc_merge(&merged, vc, incoming);
     *vc = merged;
     vc_increment(vc, own_node);
 }
 
-VCOrder vc_compare(const VectorClock* a, const VectorClock* b) {
+VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
     bool a_le_b = true, b_le_a = true;
 
-    /* 收集 a 和 b 中所有出现过的节点 */
     char all_nodes[VC_MAX_NODES][VC_NODE_ID_LEN];
     int all_count = 0;
     for (int i = 0; i < a->count; i++) {
@@ -105,7 +102,6 @@ VCOrder vc_compare(const VectorClock* a, const VectorClock* b) {
     return VC_CONCURRENT;
 }
 
-
 const char *vc_order_str(VCOrder o) {
     switch (o) {
         case VC_BEFORE:     return "before";
@@ -115,3 +111,91 @@ const char *vc_order_str(VCOrder o) {
         default:            return "unknown";
     }
 }
+
+/* ======== v3 新增 ======== */
+
+int vc_to_json(const VectorClock *vc, char *buf, int buf_size) {
+    int pos = 0;
+    pos += snprintf(buf + pos, buf_size - pos, "{");
+    for (int i = 0; i < vc->count; i++) {
+        if (i > 0) pos += snprintf(buf + pos, buf_size - pos, ",");
+        pos += snprintf(buf + pos, buf_size - pos, "\"%s\":%d",
+                        vc->comps[i].node_id, vc->comps[i].counter);
+    }
+    pos += snprintf(buf + pos, buf_size - pos, "}");
+    return pos;
+}
+
+bool vc_from_json(VectorClock *vc, const char *json) {
+    vc_init(vc);
+    const char *p = json;
+
+    while (*p && *p != '{') p++;
+    if (*p == '{') p++;
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == '}' || *p == '\0') break;
+
+        if (*p != '"') break;
+        p++;
+        char key[VC_NODE_ID_LEN];
+        int ki = 0;
+        while (*p && *p != '"' && ki < VC_NODE_ID_LEN - 1) {
+            key[ki++] = *p++;
+        }
+        key[ki] = '\0';
+        if (*p == '"') p++;
+
+        while (*p && *p != ':') p++;
+        if (*p == ':') p++;
+
+        while (*p == ' ') p++;
+        int val = 0;
+        while (*p >= '0' && *p <= '9') {
+            val = val * 10 + (*p - '0');
+            p++;
+        }
+        vc_set(vc, key, val);
+    }
+    return true;
+}
+
+void vc_print(const VectorClock *vc) {
+    char buf[256];
+    vc_to_json(vc, buf, sizeof(buf));
+    printf("%s", buf);
+}
+
+#ifdef VECTOR_CLOCK_TEST
+int main(void) {
+    VectorClock a, b;
+    printf("=== 向量时钟测试 ===\n");
+
+    vc_init(&a);
+    vc_init(&b);
+
+    /* A 发生 3 个事件 */
+    vc_increment(&a, "A");
+    vc_increment(&a, "A");
+    vc_increment(&a, "A");
+    printf("A after 3 events: "); vc_print(&a); printf("\n");
+
+    /* B 发生 1 个事件 */
+    vc_increment(&b, "B");
+    printf("B after 1 event:  "); vc_print(&b); printf("\n");
+
+    /* B 收到 A 的消息 (vc={'A':2}) */
+    VectorClock a2;
+    vc_init(&a2);
+    vc_set(&a2, "A", 2);
+    vc_receive(&b, &a2, "B");
+    printf("B after recv A:2: "); vc_print(&b); printf("\n");
+
+    /* 比较 */
+    printf("a vs b: %s\n", vc_order_str(vc_compare(&a, &b)));
+
+    printf("All tests passed!\n");
+    return 0;
+}
+#endif
