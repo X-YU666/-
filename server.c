@@ -1,8 +1,7 @@
 /*
- * server.c v5 — 倒排索引 + search 全文检索
- * 新增：idx_add() 交付时写入索引
- *       list 列出全部日志
- *       search <词> 全文关键词检索
+ * server.c v6 — 按节点过滤：list <节点>
+ * 新增：list_node() 只显示指定节点的日志
+ *       help 补全 list <节点> 文档
  * 用法: server.exe [管道名]
  */
 #include <stdio.h>
@@ -51,7 +50,6 @@ static void handle_line(const char *line) {
     LogEntry d[MAX_ENTRIES];
     int dc = buf_add(&g_buf, &e, d);
     for (int i = 0; i < dc; i++) {
-        /* v5: 可交付消息写入倒排索引 */
         idx_add(&g_idx, &d[i]);
         printf("[交付] [%s] %s\n", d[i].node_id, d[i].message);
     }
@@ -86,6 +84,20 @@ static DWORD WINAPI pipe_thread(LPVOID arg) {
 
 /* ========== 命令处理 ========== */
 
+/* v6: 按节点过滤 */
+static void list_node(const char *node_id) {
+    int cnt = 0;
+    for (int i = 0; i < g_idx.entry_count; i++) {
+        if (strcmp(g_idx.entries[i].node_id, node_id) == 0) {
+            printf("  %s\n", g_idx.entries[i].message);
+            cnt++;
+        }
+    }
+    if (cnt == 0) {
+        printf("  (无节点 %s 的日志)\n", node_id);
+    }
+}
+
 static void cmd(const char *c) {
     if (strcmp(c, "exit") == 0) {
         InterlockedExchange(&g_running, 0);
@@ -95,6 +107,7 @@ static void cmd(const char *c) {
     if (strcmp(c, "help") == 0) {
         printf("  search <词>  — 全文检索\n");
         printf("  list         — 列出全部\n");
+        printf("  list <节点>  — 按节点过滤\n");
         printf("  count        — 查看统计\n");
         printf("  exit         — 关闭服务器\n");
         return;
@@ -104,7 +117,6 @@ static void cmd(const char *c) {
                g_idx.entry_count, g_buf.buf_count);
         return;
     }
-    /* v5: 列出全部日志 */
     if (strcmp(c, "list") == 0) {
         if (g_idx.entry_count == 0) {
             printf("  (暂无日志)\n");
@@ -117,7 +129,11 @@ static void cmd(const char *c) {
         }
         return;
     }
-    /* v5: 关键词检索 */
+    /* v6: list <节点> */
+    if (strncmp(c, "list ", 5) == 0) {
+        list_node(c + 5);
+        return;
+    }
     if (strncmp(c, "search ", 7) == 0) {
         LogEntry r[MAX_ENTRIES];
         int n = idx_search(&g_idx, c + 7, r);
@@ -163,8 +179,8 @@ int main(int argc, char *argv[]) {
     buf_init(&g_buf);
 
     printf("+------------------------------------------+\n");
-    printf("| 向量时钟分布式日志聚合服务器 v5           |\n");
-    printf("| 新增：倒排索引 + search 全文检索          |\n");
+    printf("| 向量时钟分布式日志聚合服务器 v6           |\n");
+    printf("| 新增：按节点过滤 list <节点>               |\n");
     printf("+------------------------------------------+\n");
     printf("等待 Agent 连接...\n\n[server] > "); fflush(stdout);
 
