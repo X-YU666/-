@@ -1,12 +1,13 @@
 /*
- * agent.c — 日志采集代理 (v1: 骨架)
+ * agent.c — 日志采集代理 (v2: 消息发送与文件读取)
  *
- * 功能：CLI 参数解析 + Named Pipe 连接 + 重试逻辑
+ * v1: CLI 参数解析 + Pipe 连接
+ * v2: + send_line / read_lines / 交互主循环
  *
- * 用法: agent.exe <A|B|C> <日志文件> [管道名]
- * 默认管道: \\.\pipe\vc_log_agg
- *
- * 后续迭代将加入消息发送、文件读取、交互主循环等。
+ * 功能：
+ *   - 打字直接发送消息（自动附带向量时钟）
+ *   - 按回车（空行）读取日志文件并发送
+ *   - vc_increment 自动维护向量时钟
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,17 +19,59 @@
 
 #define MAX_LINE  1024
 #define MAX_JSON  2048
+#define MAX_LINES 100
 
 static VectorClock g_vc;
 static char        g_node_id[16];
+static long        g_file_offset;
 static HANDLE      g_pipe = INVALID_HANDLE_VALUE;
+
+/* 通过 Named Pipe 发送一条 JSON 格式的日志 */
+static int send_line(const char *node, const char *msg, const VectorClock *vc) {
+    char json[MAX_JSON], vj[256];
+    vc_to_json(vc, vj, sizeof(vj));
+    int n = snprintf(json, sizeof(json),
+        "{\"node_id\":\"%s\",\"message\":\"%s\",\"vector_clock\":%s}\n",
+        node, msg, vj);
+    DWORD w;
+    if (!WriteFile(g_pipe, json, n, &w, NULL)) {
+        printf("  [错误] 发送失败 (err=%lu)\n", GetLastError());
+        return 0;
+    }
+    return 1;
+}
+
+/* 从日志文件读取新行（跳过已读过的偏移量） */
+static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz <= g_file_offset) {
+        if (sz < g_file_offset) g_file_offset = 0;  /* 日志轮转检测 */
+        fclose(f);
+        return 0;
+    }
+
+    fseek(f, g_file_offset, SEEK_SET);
+    int cnt = 0;
+    while (cnt < maxl && fgets(lines[cnt], MAX_LINE, f)) {
+        int l = (int)strlen(lines[cnt]);
+        while (l > 0 && (lines[cnt][l-1] == '\n' || lines[cnt][l-1] == '\r'))
+            lines[cnt][--l] = 0;
+        if (l > 0) cnt++;
+    }
+    g_file_offset = ftell(f);
+    fclose(f);
+    return cnt;
+}
 
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
 
     if (argc < 3) {
         printf("用法: %s <A|B|C> <日志文件> [管道名]\n", argv[0]);
-        printf("管道默认: \\\\.\\pipe\\vc_log_agg\n");
         return 1;
     }
 
@@ -37,43 +80,58 @@ int main(int argc, char *argv[]) {
     const char *pipename = (argc > 3) ? argv[3] : "\\\\.\\pipe\\vc_log_agg";
     vc_init(&g_vc);
 
-    printf("Agent [%s] 启动\n", g_node_id);
-    printf("日志文件: %s\n", logf);
     printf("连接管道: %s ...\n", pipename);
-
-    /* 尝试连接 Server 的 Named Pipe，最多重试 60 次（~15秒） */
     for (int i = 0; i < 60; i++) {
         g_pipe = CreateFileA(pipename, GENERIC_WRITE, FILE_SHARE_READ,
                              NULL, OPEN_EXISTING, 0, NULL);
-        if (g_pipe != INVALID_HANDLE_VALUE) {
-            printf("管道连接成功\n");
-            break;
-        }
+        if (g_pipe != INVALID_HANDLE_VALUE) break;
         DWORD e = GetLastError();
         if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PIPE_BUSY) {
-            printf("连接失败 (err=%lu)\n请先启动 server.exe\n", e);
+            printf("连接失败 err=%lu\n请先启动 server.exe\n", e);
             return 1;
         }
-        printf("等待 server 启动... (%d/60)\n", i + 1);
         Sleep(250);
     }
-
     if (g_pipe == INVALID_HANDLE_VALUE) {
-        printf("连接超时，请确认 server.exe 已启动\n");
+        printf("连接超时 (server 未启动?)\n");
         return 1;
     }
 
     printf("========================================\n");
-    printf(" 日志采集代理 Agent [%s] (骨架)\n", g_node_id);
+    printf(" 日志采集代理 Agent [%s]\n", g_node_id);
+    printf(" 管道: %s\n", pipename);
     printf("========================================\n");
-    printf("等待后续实现...\n");
+    printf(" 打字→发送 | 空行→读文件 | exit\n\n");
 
-    /* 暂时空循环，后续加入消息发送逻辑 */
-    printf("按 Ctrl+C 退出\n");
+    char buf[MAX_LINE];
     while (1) {
-        Sleep(1000);
+        printf("[%s] > ", g_node_id);
+        if (!fgets(buf, sizeof(buf), stdin)) break;
+        int il = (int)strlen(buf);
+        while (il > 0 && (buf[il-1] == '\n' || buf[il-1] == '\r'))
+            buf[--il] = 0;
+
+        if (il == 0) {
+            /* 空行 → 读日志文件 */
+            char lines[MAX_LINES][MAX_LINE];
+            int n = read_lines(logf, MAX_LINES, lines);
+            for (int i = 0; i < n; i++) {
+                vc_increment(&g_vc, g_node_id);
+                send_line(g_node_id, lines[i], &g_vc);
+                printf("  [发送] %s\n", lines[i]);
+            }
+            if (!n) printf("  (无新行)\n");
+        } else if (strcmp(buf, "exit") == 0) {
+            break;
+        } else {
+            /* 直接打字发送 */
+            vc_increment(&g_vc, g_node_id);
+            send_line(g_node_id, buf, &g_vc);
+            printf("  [发送] %s\n", buf);
+        }
     }
 
     CloseHandle(g_pipe);
+    printf("[%s] 已退出\n", g_node_id);
     return 0;
 }
