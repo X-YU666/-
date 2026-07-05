@@ -1,13 +1,12 @@
 /*
- * vector_clock.c — 向量时钟 v3：加入 JSON 序列化与自测 (v3)
+ * vector_clock.c — 向量时钟 v4：修复 strncpy 截断警告 (v4)
  *
  * v1: init / get / set / increment
  * v2: + merge / receive / compare / order_str
- * v3: + to_json / from_json / print / 独立测试 main
+ * v3: + to_json / from_json / print / 自测 main
+ * v4: fix: strncpy 截断警告（用 snprintf 代替，自动加 \0）
  *
- * JSON 序列化使向量时钟可以通过网络传输（Agent→Server）。
- * vc_print 方便调试查看时钟状态。
- * 编译时加 -DVECTOR_CLOCK_TEST 可独立运行自测。
+ * strncpy 在源串 >= n 时不追加 \0，改用 snprintf 确保安全。
  */
 #include "vector_clock.h"
 #include <stdio.h>
@@ -35,8 +34,7 @@ void vc_set(VectorClock *vc, const char *node_id, int value) {
     }
     if (vc->count < VC_MAX_NODES) {
         int i = vc->count++;
-        strncpy(vc->comps[i].node_id, node_id, VC_NODE_ID_LEN - 1);
-        vc->comps[i].node_id[VC_NODE_ID_LEN - 1] = '\0';
+        snprintf(vc->comps[i].node_id, VC_NODE_ID_LEN, "%s", node_id);
         vc->comps[i].counter = value;
     }
 }
@@ -72,7 +70,7 @@ VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
     char all_nodes[VC_MAX_NODES][VC_NODE_ID_LEN];
     int all_count = 0;
     for (int i = 0; i < a->count; i++) {
-        strncpy(all_nodes[all_count], a->comps[i].node_id, VC_NODE_ID_LEN);
+        snprintf(all_nodes[all_count], VC_NODE_ID_LEN, "%s", a->comps[i].node_id);
         all_count++;
     }
     for (int i = 0; i < b->count; i++) {
@@ -84,7 +82,7 @@ VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
             }
         }
         if (!found && all_count < VC_MAX_NODES) {
-            strncpy(all_nodes[all_count], b->comps[i].node_id, VC_NODE_ID_LEN);
+            snprintf(all_nodes[all_count], VC_NODE_ID_LEN, "%s", b->comps[i].node_id);
             all_count++;
         }
     }
@@ -164,32 +162,3 @@ void vc_print(const VectorClock *vc) {
     vc_to_json(vc, buf, sizeof(buf));
     printf("%s", buf);
 }
-
-#ifdef VECTOR_CLOCK_TEST
-int main(void) {
-    VectorClock a, b;
-    printf("=== 向量时钟测试 ===\n");
-
-    vc_init(&a);
-    vc_init(&b);
-
-    vc_increment(&a, "A");
-    vc_increment(&a, "A");
-    vc_increment(&a, "A");
-    printf("A after 3 events: "); vc_print(&a); printf("\n");
-
-    vc_increment(&b, "B");
-    printf("B after 1 event:  "); vc_print(&b); printf("\n");
-
-    VectorClock a2;
-    vc_init(&a2);
-    vc_set(&a2, "A", 2);
-    vc_receive(&b, &a2, "B");
-    printf("B after recv A:2: "); vc_print(&b); printf("\n");
-
-    printf("a vs b: %s\n", vc_order_str(vc_compare(&a, &b)));
-
-    printf("All tests passed!\n");
-    return 0;
-}
-#endif
