@@ -65,6 +65,10 @@ static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
 }
 
 int main(int argc, char *argv[]) {
+    setbuf(stdout, NULL);
+    /* UTF-8 控制台支持 */
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
 
     if (argc < 3) {
         printf("用法: %s <A|B|C> <日志文件> [管道名]\n", argv[0]);
