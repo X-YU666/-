@@ -1,13 +1,12 @@
 /*
- * agent.c — 日志采集代理 (v2: 消息发送与文件读取)
+ * agent.c — 日志采集代理 (v3: 命令扩展与错误处理)
  *
  * v1: CLI 参数解析 + Pipe 连接
  * v2: + send_line / read_lines / 交互主循环
+ * v3: + show 命令 / exit 优雅退出 / 错误提示优化 / UTF-8 支持
  *
- * 功能：
- *   - 打字直接发送消息（自动附带向量时钟）
- *   - 按回车（空行）读取日志文件并发送
- *   - vc_increment 自动维护向量时钟
+ * show: 查看当前向量时钟状态
+ * UTF-8: SetConsoleOutputCP 确保中文正常显示
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +25,6 @@ static char        g_node_id[16];
 static long        g_file_offset;
 static HANDLE      g_pipe = INVALID_HANDLE_VALUE;
 
-/* 通过 Named Pipe 发送一条 JSON 格式的日志 */
 static int send_line(const char *node, const char *msg, const VectorClock *vc) {
     char json[MAX_JSON], vj[256];
     vc_to_json(vc, vj, sizeof(vj));
@@ -41,7 +39,6 @@ static int send_line(const char *node, const char *msg, const VectorClock *vc) {
     return 1;
 }
 
-/* 从日志文件读取新行（跳过已读过的偏移量） */
 static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
@@ -49,7 +46,7 @@ static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     if (sz <= g_file_offset) {
-        if (sz < g_file_offset) g_file_offset = 0;  /* 日志轮转检测 */
+        if (sz < g_file_offset) g_file_offset = 0;
         fclose(f);
         return 0;
     }
@@ -68,10 +65,10 @@ static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
 }
 
 int main(int argc, char *argv[]) {
-    setbuf(stdout, NULL);
 
     if (argc < 3) {
         printf("用法: %s <A|B|C> <日志文件> [管道名]\n", argv[0]);
+        printf("管道默认: \\\\.\\pipe\\vc_log_agg\n");
         return 1;
     }
 
@@ -101,7 +98,7 @@ int main(int argc, char *argv[]) {
     printf(" 日志采集代理 Agent [%s]\n", g_node_id);
     printf(" 管道: %s\n", pipename);
     printf("========================================\n");
-    printf(" 打字→发送 | 空行→读文件 | exit\n\n");
+    printf(" 打字→发送 | 空行→读文件 | show | exit\n\n");
 
     char buf[MAX_LINE];
     while (1) {
@@ -112,7 +109,6 @@ int main(int argc, char *argv[]) {
             buf[--il] = 0;
 
         if (il == 0) {
-            /* 空行 → 读日志文件 */
             char lines[MAX_LINES][MAX_LINE];
             int n = read_lines(logf, MAX_LINES, lines);
             for (int i = 0; i < n; i++) {
@@ -122,12 +118,17 @@ int main(int argc, char *argv[]) {
             }
             if (!n) printf("  (无新行)\n");
         } else if (strcmp(buf, "exit") == 0) {
+            printf("[%s] 正在退出...\n", g_node_id);
             break;
+        } else if (strcmp(buf, "show") == 0) {
+            printf("  向量时钟: ");
+            vc_print(&g_vc);
+            printf("\n");
         } else {
-            /* 直接打字发送 */
             vc_increment(&g_vc, g_node_id);
-            send_line(g_node_id, buf, &g_vc);
-            printf("  [发送] %s\n", buf);
+            if (send_line(g_node_id, buf, &g_vc)) {
+                printf("  [发送] %s\n", buf);
+            }
         }
     }
 
