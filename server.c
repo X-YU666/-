@@ -1,7 +1,6 @@
 /*
- * server.c v6 — 按节点过滤：list <节点>
- * 新增：list_node() 只显示指定节点的日志
- *       help 补全 list <节点> 文档
+ * server.c v7 — 缓冲容量控制 + Ctrl+C 优雅关闭
+ * 新增：缓冲满警告 / SetConsoleCtrlHandler / 结束统计
  * 用法: server.exe [管道名]
  */
 #include <stdio.h>
@@ -15,6 +14,16 @@
 static InvertedIndex g_idx;
 static CausalBuffer  g_buf;
 static volatile LONG g_running = 1;
+
+/* v7: Ctrl+C 信号处理 */
+static BOOL WINAPI signal_handler(DWORD sig) {
+    if (sig == CTRL_C_EVENT || sig == CTRL_BREAK_EVENT) {
+        printf("\n[关闭] 收到 Ctrl+C，正在清理...\n");
+        InterlockedExchange(&g_running, 0);
+        return TRUE;
+    }
+    return FALSE;
+}
 
 /* ========== JSON 解析 ========== */
 
@@ -56,6 +65,13 @@ static void handle_line(const char *line) {
     if (dc == 0) {
         printf("[缓存] [%s] %s  (等待依赖)\n", e.node_id, e.message);
     }
+
+    /* v7: 缓冲接近上限时警告 */
+    if (g_buf.buf_count >= MAX_ENTRIES - 5) {
+        printf("[警告] 缓冲接近上限: %d/%d\n",
+               g_buf.buf_count, MAX_ENTRIES);
+    }
+
     printf("[server] > "); fflush(stdout);
 }
 
@@ -84,7 +100,6 @@ static DWORD WINAPI pipe_thread(LPVOID arg) {
 
 /* ========== 命令处理 ========== */
 
-/* v6: 按节点过滤 */
 static void list_node(const char *node_id) {
     int cnt = 0;
     for (int i = 0; i < g_idx.entry_count; i++) {
@@ -113,8 +128,8 @@ static void cmd(const char *c) {
         return;
     }
     if (strcmp(c, "count") == 0) {
-        printf("  已交付: %d  缓冲中: %d\n",
-               g_idx.entry_count, g_buf.buf_count);
+        printf("  已交付: %d  缓冲: %d/%d\n",
+               g_idx.entry_count, g_buf.buf_count, MAX_ENTRIES);
         return;
     }
     if (strcmp(c, "list") == 0) {
@@ -129,7 +144,6 @@ static void cmd(const char *c) {
         }
         return;
     }
-    /* v6: list <节点> */
     if (strncmp(c, "list ", 5) == 0) {
         list_node(c + 5);
         return;
@@ -173,14 +187,17 @@ int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
     SetConsoleOutputCP(65001);
 
+    /* v7: 注册 Ctrl+C */
+    SetConsoleCtrlHandler(signal_handler, TRUE);
+
     const char *pn = argc > 1 ? argv[1] : "\\\\.\\pipe\\vc_log_agg";
 
     idx_init(&g_idx);
     buf_init(&g_buf);
 
     printf("+------------------------------------------+\n");
-    printf("| 向量时钟分布式日志聚合服务器 v6           |\n");
-    printf("| 新增：按节点过滤 list <节点>               |\n");
+    printf("| 向量时钟分布式日志聚合服务器 v7           |\n");
+    printf("| 新增：缓冲容量控制 + 优雅关闭              |\n");
     printf("+------------------------------------------+\n");
     printf("等待 Agent 连接...\n\n[server] > "); fflush(stdout);
 
@@ -224,6 +241,11 @@ int main(int argc, char *argv[]) {
             printf("[server] > ");
         }
     }
+
+    /* v7: 关闭统计 */
+    printf("\n[关闭] 总计: 交付 %d 条, 缓冲残留 %d 条\n",
+           g_idx.entry_count, g_buf.buf_count);
+
     CloseHandle(ov.hEvent);
     CloseHandle(hPipe);
     return 0;
