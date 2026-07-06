@@ -25,7 +25,24 @@ static char        g_node_id[16];
 static long        g_file_offset;
 static HANDLE      g_pipe = INVALID_HANDLE_VALUE;
 
+/* 重连管道 */
+static int reconnect_pipe(const char *pipename) {
+    CloseHandle(g_pipe);
+    g_pipe = INVALID_HANDLE_VALUE;
 
+    printf("  [重连] 尝试重新连接管道...\n");
+    for (int i = 0; i < 30; i++) {
+        g_pipe = CreateFileA(pipename, GENERIC_WRITE, FILE_SHARE_READ,
+                             NULL, OPEN_EXISTING, 0, NULL);
+        if (g_pipe != INVALID_HANDLE_VALUE) {
+            printf("  [重连] 成功\n");
+            return 1;
+        }
+        Sleep(500);
+    }
+    printf("  [错误] 重连失败\n");
+    return 0;
+}
 
 static int send_line(const char *node, const char *msg, const VectorClock *vc,
                      const char *pipename) {
@@ -37,6 +54,7 @@ static int send_line(const char *node, const char *msg, const VectorClock *vc,
     DWORD w;
     if (!WriteFile(g_pipe, json, n, &w, NULL)) {
         printf("  [错误] 发送失败 (err=%lu)\n", GetLastError());
+        /* 尝试重连 */
         if (reconnect_pipe(pipename)) {
             return WriteFile(g_pipe, json, n, &w, NULL) ? 1 : 0;
         }
