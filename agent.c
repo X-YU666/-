@@ -70,6 +70,11 @@ static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
 
+    /* 文件大小变小 → 日志轮转发生 → 重置偏移 */
+    if (sz < g_file_offset) {
+        printf("  [轮转] 检测到日志文件轮转，重置读取位置\n");
+        g_file_offset = 0;
+    }
 
     if (sz <= g_file_offset) {
         fclose(f);
