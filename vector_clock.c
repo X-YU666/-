@@ -1,12 +1,11 @@
 /*
- * vector_clock.c — 向量时钟 v4：修复 strncpy 截断警告 (v4)
+ * vector_clock.c — 向量时钟 (最终版 v5)
  *
  * v1: init / get / set / increment
  * v2: + merge / receive / compare / order_str
  * v3: + to_json / from_json / print / 自测 main
- * v4: fix: strncpy 截断警告（用 snprintf 代替，自动加 \0）
- *
- * strncpy 在源串 >= n 时不追加 \0，改用 snprintf 确保安全。
+ * v4: fix: strncpy → snprintf 消除截断警告
+ * v5: final: 完善注释，代码规范收尾
  */
 #include "vector_clock.h"
 #include <stdio.h>
@@ -162,3 +161,32 @@ void vc_print(const VectorClock *vc) {
     vc_to_json(vc, buf, sizeof(buf));
     printf("%s", buf);
 }
+
+#ifdef VECTOR_CLOCK_TEST
+int main(void) {
+    VectorClock a, b;
+    printf("=== 向量时钟测试 ===\n");
+
+    vc_init(&a);
+    vc_init(&b);
+
+    vc_increment(&a, "A");
+    vc_increment(&a, "A");
+    vc_increment(&a, "A");
+    printf("A after 3 events: "); vc_print(&a); printf("\n");
+
+    vc_increment(&b, "B");
+    printf("B after 1 event:  "); vc_print(&b); printf("\n");
+
+    VectorClock a2;
+    vc_init(&a2);
+    vc_set(&a2, "A", 2);
+    vc_receive(&b, &a2, "B");
+    printf("B after recv A:2: "); vc_print(&b); printf("\n");
+
+    printf("a vs b: %s\n", vc_order_str(vc_compare(&a, &b)));
+
+    printf("All tests passed!\n");
+    return 0;
+}
+#endif

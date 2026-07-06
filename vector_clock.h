@@ -4,6 +4,15 @@
  * 分布式系统中追踪事件因果关系的逻辑时钟。
  * 每个节点维护 N 元向量，本地事件自增自身分量，
  * 接收消息时逐分量取最大值合并。
+ *
+ * 核心操作：
+ *   vc_init       - 初始化
+ *   vc_get/set    - 读写分量
+ *   vc_increment  - 本地事件自增
+ *   vc_merge      - 合并两个时钟（取各分量 max）
+ *   vc_receive    - 接收消息：merge 后自增
+ *   vc_compare    - 因果序比较（before/after/concurrent/equal）
+ *   vc_to_json / vc_from_json - 网络传输序列化
  */
 
 #ifndef VECTOR_CLOCK_H
