@@ -1,8 +1,6 @@
 /*
- * server.c v9 — 新增：多 Agent 并发连接
- * pipe_accept_thread 独立线程等待连接
- * pipe_worker 独立线程处理每个 Agent 的数据
- * 主线程只做键盘输入（fgets 模式）
+ * server.c v9 — 新增：开头空格容错
+ * 命令前多打了空格也能正确识别
  * 用法: server.exe [管道名]
  */
 #include <stdio.h>
@@ -18,7 +16,6 @@
 #define PIPE_BUF 4096
 static InvertedIndex g_idx; static CausalBuffer g_buf; static volatile LONG g_running=1; static int g_error_count=0;
 static FILE *g_pf=NULL; static const char *PERSIST_PATH="logs.jsonl";
-
 static void li(const char*f,...){va_list a;va_start(a,f);time_t t=time(NULL);struct tm*tm=localtime(&t);printf("[%02d:%02d:%02d] ",tm->tm_hour,tm->tm_min,tm->tm_sec);vprintf(f,a);printf("\n");fflush(stdout);va_end(a);}
 static void le(const char*f,...){va_list a;va_start(a,f);time_t t=time(NULL);struct tm*tm=localtime(&t);printf("[ERR %02d:%02d:%02d] ",tm->tm_hour,tm->tm_min,tm->tm_sec);vprintf(f,a);printf("\n");fflush(stdout);g_error_count++;va_end(a);}
 static BOOL WINAPI sh(DWORD s){if(s==CTRL_C_EVENT||s==CTRL_BREAK_EVENT){li("收到关闭信号");InterlockedExchange(&g_running,0);return TRUE;}return FALSE;}
@@ -31,14 +28,11 @@ static void je(const char*s,char*d,int n){int i=0;while(*s&&i<n-1){switch(*s){ca
 static void se(const LogEntry*e){if(!g_pf)return;char v[256];vc_to_json(&e->vector_clock,v,sizeof(v));char m[1024];je(e->message,m,sizeof(m));fprintf(g_pf,"{\"node_id\":\"%s\",\"timestamp\":%.0f,\"level\":\"%s\",\"message\":\"%s\",\"vector_clock\":%s}\n",e->node_id,e->timestamp,e->level,m,v);fflush(g_pf);}
 static int pjl(const char*l,LogEntry*e){memset(e,0,sizeof(*e));if(!js(l,"node_id",e->node_id,sizeof(e->node_id)))return 0;if(!js(l,"message",e->message,sizeof(e->message)))return 0;if(!jvc(l,&e->vector_clock))return 0;e->timestamp=(double)ji(l,"timestamp");if(e->timestamp<0)e->timestamp=0;if(!js(l,"level",e->level,sizeof(e->level)))strcpy(e->level,"INFO");return 1;}
 static void lp(void){FILE*f=fopen(PERSIST_PATH,"r");if(!f){li("日志文件不存在，全新启动");return;}char l[PIPE_BUF];int ld=0,er=0;while(fgets(l,sizeof(l),f)){int len=(int)strlen(l);while(len>0&&(l[len-1]=='\n'||l[len-1]=='\r'))l[--len]=0;if(len==0)continue;LogEntry e;if(pjl(l,&e)){idx_add(&g_idx,&e);ld++;}else er++;}fclose(f);li("加载持久化: %d 条 (错误 %d)",ld,er);}
-
-/* ===== 多 Agent 并发架构 ===== */
-typedef struct { HANDLE pipe; ULONG pid; } ClientCtx;
+typedef struct{HANDLE pipe;ULONG pid;}ClientCtx;
 static void hl(const char*line){LogEntry e;if(!pjl(line,&e))return;li("收到 [%s][%s] %s",e.node_id,e.level,e.message);printf("       ts: %.0f  vc: ",e.timestamp);vc_print(&e.vector_clock);printf("\n");LogEntry d[MAX_ENTRIES];int dc=buf_add(&g_buf,&e,d);for(int i=0;i<dc;i++){idx_add(&g_idx,&d[i]);se(&d[i]);li("交付 [%s] %s",d[i].node_id,d[i].message);}if(dc==0)li("缓存 [%s] %s",e.node_id,e.message);if(g_buf.buf_count>=MAX_ENTRIES-5)li("缓冲接近上限: %d/%d",g_buf.buf_count,MAX_ENTRIES);}
 static DWORD WINAPI pw(LPVOID a){ClientCtx*ctx=(ClientCtx*)a;char l[PIPE_BUF];int lp=0;li("Agent 连接 #%lu",ctx->pid);while(g_running){DWORD n;char c[1024];if(!ReadFile(ctx->pipe,c,sizeof(c),&n,NULL)||n==0){le("Agent 断开");break;}for(DWORD i=0;i<n&&lp<(int)sizeof(l)-1;i++){if(c[i]=='\n'){if(lp>0){l[lp]=0;hl(l);lp=0;}}else if(c[i]!='\r'){l[lp++]=c[i];}}}DisconnectNamedPipe(ctx->pipe);CloseHandle(ctx->pipe);free(ctx);return 0;}
-typedef struct { const char *pn; } PipeAcceptCtx;
+typedef struct{const char*pn;}PipeAcceptCtx;
 static DWORD WINAPI pa(LPVOID a){PipeAcceptCtx*ac=(PipeAcceptCtx*)a;while(g_running){HANDLE h=CreateNamedPipeA(ac->pn,PIPE_ACCESS_INBOUND,PIPE_TYPE_MESSAGE|PIPE_READMODE_MESSAGE|PIPE_WAIT,PIPE_UNLIMITED_INSTANCES,PIPE_BUF,PIPE_BUF,0,NULL);if(h==INVALID_HANDLE_VALUE){le("创建管道失败 err=%lu",GetLastError());break;}if(!ConnectNamedPipe(h,NULL)&&GetLastError()!=ERROR_PIPE_CONNECTED){le("ConnectNamedPipe 失败");CloseHandle(h);break;}if(!g_running){CloseHandle(h);break;}ClientCtx*ctx=malloc(sizeof(ClientCtx));ctx->pipe=h;GetNamedPipeClientProcessId(h,&ctx->pid);CreateThread(NULL,0,pw,ctx,0,NULL);}return 0;}
-
 static void ln(const char*id){int cnt=0;for(int i=0;i<g_idx.entry_count;i++){if(strcmp(g_idx.entries[i].node_id,id)==0){printf("  [%s] %s\n",g_idx.entries[i].level,g_idx.entries[i].message);cnt++;}}if(cnt==0)printf("  (无节点 %s 的日志)\n",id);}
 static void cmd(const char*c){
     if(strcmp(c,"exit")==0){li("exit 命令");InterlockedExchange(&g_running,0);return;}
@@ -69,13 +63,14 @@ static void cmd(const char*c){
     }
     printf("  未知命令 (help 查看)\n");
 }
-
 int main(int argc,char*argv[]){setbuf(stdout,NULL);SetConsoleOutputCP(65001);SetConsoleCP(65001);SetConsoleCtrlHandler(sh,TRUE);
     const char*pn=argc>1?argv[1]:"\\\\.\\pipe\\vc_log_agg";if(argc>1&&!vpn(argv[1]))return 1;
     idx_init(&g_idx);buf_init(&g_buf);li("索引初始化完成");
     g_pf=fopen(PERSIST_PATH,"a");if(!g_pf)le("无法打开持久化文件");else li("持久化文件: %s",PERSIST_PATH);lp();
-    printf("+------------------------------------------+\n| 向量时钟分布式日志聚合服务器 v9           |\n| 多 Agent 并发连接                         |\n+------------------------------------------+\n");li("管道: %s",pn);printf("等待 Agent 连接...\n\n[server] > ");fflush(stdout);
+    printf("+------------------------------------------+\n| 向量时钟分布式日志聚合服务器 v9           |\n| 空格容错                                   |\n+------------------------------------------+\n");li("管道: %s",pn);printf("等待 Agent 连接...\n\n[server] > ");fflush(stdout);
     PipeAcceptCtx ac={pn};HANDLE hpt=CreateThread(NULL,0,pa,&ac,0,NULL);
-    while(g_running){printf("[server] > ");fflush(stdout);char inp[512];if(!fgets(inp,sizeof(inp),stdin))break;int len=(int)strlen(inp);while(len>0&&(inp[len-1]=='\n'||inp[len-1]=='\r'))inp[--len]=0;if(len>0){const char*t=inp;while(*t==' '||*t=='\t')t++;if(*t)cmd(t);}}
+    while(g_running){printf("[server] > ");fflush(stdout);char inp[512];if(!fgets(inp,sizeof(inp),stdin))break;int len=(int)strlen(inp);while(len>0&&(inp[len-1]=='\n'||inp[len-1]=='\r'))inp[--len]=0;
+        if(len>0){const char*t=inp;while(*t==' '||*t=='\t')t++;if(*t)cmd(t);} /* 空格容错 */
+    }
     if(g_pf)fclose(g_pf);li("关闭完毕: 交付 %d 条, 残留 %d 条, 错误 %d 次",g_idx.entry_count,g_buf.buf_count,g_error_count);WaitForSingleObject(hpt,3000);return 0;
 }
