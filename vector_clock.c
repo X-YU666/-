@@ -1,16 +1,9 @@
 /*
- * vector_clock.c — 向量时钟 (最终版 v5)
- *
- * v1: init / get / set / increment
- * v2: + merge / receive / compare / order_str
- * v3: + to_json / from_json / print / 自测 main
- * v4: fix: strncpy → snprintf 消除截断警告
- * v5: final: 完善注释，代码规范收尾
+ * vector_clock.c — 向量时钟实现
  */
 #include "vector_clock.h"
 #include <stdio.h>
 #include <string.h>
-#include <stdbool.h>
 
 void vc_init(VectorClock *vc) {
     vc->count = 0;
@@ -31,9 +24,11 @@ void vc_set(VectorClock *vc, const char *node_id, int value) {
             return;
         }
     }
+    /* 新增分量 */
     if (vc->count < VC_MAX_NODES) {
         int i = vc->count++;
-        snprintf(vc->comps[i].node_id, VC_NODE_ID_LEN, "%s", node_id);
+        strncpy(vc->comps[i].node_id, node_id, VC_NODE_ID_LEN - 1);
+        vc->comps[i].node_id[VC_NODE_ID_LEN - 1] = '\0';
         vc->comps[i].counter = value;
     }
 }
@@ -45,11 +40,13 @@ void vc_increment(VectorClock *vc, const char *own_node) {
 
 void vc_merge(VectorClock *dst, const VectorClock *a, const VectorClock *b) {
     vc_init(dst);
+    /* 遍历 a */
     for (int i = 0; i < a->count; i++) {
         int vb = vc_get(b, a->comps[i].node_id);
         int mx = a->comps[i].counter > vb ? a->comps[i].counter : vb;
         vc_set(dst, a->comps[i].node_id, mx);
     }
+    /* 遍历 b 中 a 没有的 */
     for (int i = 0; i < b->count; i++) {
         if (vc_get(a, b->comps[i].node_id) == 0)
             vc_set(dst, b->comps[i].node_id, b->comps[i].counter);
@@ -66,10 +63,11 @@ void vc_receive(VectorClock *vc, const VectorClock *incoming, const char *own_no
 VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
     bool a_le_b = true, b_le_a = true;
 
+    /* 收集所有节点 */
     char all_nodes[VC_MAX_NODES][VC_NODE_ID_LEN];
     int all_count = 0;
     for (int i = 0; i < a->count; i++) {
-        snprintf(all_nodes[all_count], VC_NODE_ID_LEN, "%s", a->comps[i].node_id);
+        strncpy(all_nodes[all_count], a->comps[i].node_id, VC_NODE_ID_LEN);
         all_count++;
     }
     for (int i = 0; i < b->count; i++) {
@@ -81,7 +79,7 @@ VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
             }
         }
         if (!found && all_count < VC_MAX_NODES) {
-            snprintf(all_nodes[all_count], VC_NODE_ID_LEN, "%s", b->comps[i].node_id);
+            strncpy(all_nodes[all_count], b->comps[i].node_id, VC_NODE_ID_LEN);
             all_count++;
         }
     }
@@ -125,15 +123,18 @@ bool vc_from_json(VectorClock *vc, const char *json) {
     vc_init(vc);
     const char *p = json;
 
+    /* 跳过开头的 {  */
     while (*p && *p != '{') p++;
     if (*p == '{') p++;
 
     while (*p) {
+        /* 跳过空白和逗号 */
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
         if (*p == '}' || *p == '\0') break;
 
+        /* 读键: "key" */
         if (*p != '"') break;
-        p++;
+        p++; /* 跳过第一个 " */
         char key[VC_NODE_ID_LEN];
         int ki = 0;
         while (*p && *p != '"' && ki < VC_NODE_ID_LEN - 1) {
@@ -142,9 +143,11 @@ bool vc_from_json(VectorClock *vc, const char *json) {
         key[ki] = '\0';
         if (*p == '"') p++;
 
+        /* 跳过冒号 */
         while (*p && *p != ':') p++;
         if (*p == ':') p++;
 
+        /* 读值 */
         while (*p == ' ') p++;
         int val = 0;
         while (*p >= '0' && *p <= '9') {
@@ -170,20 +173,24 @@ int main(void) {
     vc_init(&a);
     vc_init(&b);
 
+    /* A 发生 3 个事件 */
     vc_increment(&a, "A");
     vc_increment(&a, "A");
     vc_increment(&a, "A");
     printf("A after 3 events: "); vc_print(&a); printf("\n");
 
+    /* B 发生 1 个事件 */
     vc_increment(&b, "B");
     printf("B after 1 event:  "); vc_print(&b); printf("\n");
 
+    /* B 收到 A 的消息 (vc={'A':2}) */
     VectorClock a2;
     vc_init(&a2);
     vc_set(&a2, "A", 2);
     vc_receive(&b, &a2, "B");
     printf("B after recv A:2: "); vc_print(&b); printf("\n");
 
+    /* 比较 */
     printf("a vs b: %s\n", vc_order_str(vc_compare(&a, &b)));
 
     printf("All tests passed!\n");
