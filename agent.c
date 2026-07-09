@@ -1,13 +1,9 @@
 /*
- * agent.c — 日志采集代理 (Linux/UDP)
- * v3: 新增日志级别解析和时间戳字段
- *
- * 改动：
- *   - 新增 parse_level()：自动提取行首 [INFO]/[WARN]/[ERROR]
- *   - JSON 扩展为 5 字段：node_id / timestamp / level / message / vector_clock
- *   - 自动监控和手动模式共享同一套增强的 JSON 输出
+ * agent.c — 日志采集代理 (Linux/UDP) — 最终版
+ * v4: 移除手动 Enter 模式，新增 monitor 开关
  *
  * 用法: ./agent <A|B|C> <日志文件> [服务器IP] [端口]
+ * 默认: 127.0.0.1:9876
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,9 +21,9 @@
 #include <fcntl.h>
 #include "vector_clock.h"
 
-#define MAX_LINE  1024
-#define MAX_JSON  2048
-#define MAX_LINES 100
+#define MAX_LINE   1024
+#define MAX_JSON   2048
+#define MAX_LINES  100
 #define DEFAULT_PORT 9876
 #define DEFAULT_ADDR "127.0.0.1"
 
@@ -41,7 +37,9 @@ static volatile int g_running    = 1;
 static volatile int g_monitoring = 1;
 static pthread_mutex_t g_send_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* --- 日志级别解析 --- */
+/* ==================================================================
+ * 日志行解析：从行首提取 [INFO]/[WARN]/[ERROR] 并透传到 level 字段
+ * ================================================================== */
 
 static const char *parse_level(char *line, char *level_out, int level_sz) {
     const char *p = line;
@@ -76,7 +74,9 @@ static const char *parse_level(char *line, char *level_out, int level_sz) {
     return level_out;
 }
 
-/* --- UDP 发送（5 字段 JSON） --- */
+/* ==================================================================
+ * UDP 发送
+ * ================================================================== */
 
 static int send_line(const char *node, const char *level,
                      const char *msg, const VectorClock *vc) {
@@ -93,14 +93,19 @@ static int send_line(const char *node, const char *level,
                           (struct sockaddr *)&g_server_addr,
                           sizeof(g_server_addr));
     pthread_mutex_unlock(&g_send_mutex);
-    if (sent < 0) { perror("  [错误] UDP 发送失败"); return 0; }
+
+    if (sent < 0) {
+        perror("  [错误] UDP 发送失败");
+        return 0;
+    }
     return 1;
 }
 
-/* --- 增量读取日志文件 --- */
+/* ==================================================================
+ * 增量读取日志文件
+ * ================================================================== */
 
-static int read_lines(const char *path, int maxl,
-                      char (*lines)[MAX_LINE]) {
+static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
 
@@ -109,14 +114,15 @@ static int read_lines(const char *path, int maxl,
 
     if (sz <= g_file_offset) {
         if (sz < g_file_offset) g_file_offset = 0;
-        fclose(f); return 0;
+        fclose(f);
+        return 0;
     }
 
     fseek(f, g_file_offset, SEEK_SET);
     int cnt = 0;
     while (cnt < maxl && fgets(lines[cnt], MAX_LINE, f)) {
         int l = (int)strlen(lines[cnt]);
-        while (l>0 && (lines[cnt][l-1]=='\n'||lines[cnt][l-1]=='\r'))
+        while (l > 0 && (lines[cnt][l-1]=='\n' || lines[cnt][l-1]=='\r'))
             lines[cnt][--l] = 0;
         if (l > 0) cnt++;
     }
@@ -125,21 +131,26 @@ static int read_lines(const char *path, int maxl,
     return cnt;
 }
 
-/* --- inotify 文件监控线程 --- */
+/* ==================================================================
+ * 文件监控线程 (inotify — Linux 事件驱动文件监听)
+ * ================================================================== */
 
 static int g_inotify_fd = -1;
 static int g_inotify_wd  = -1;
 
+/* 添加/更新 inotify 监视 */
 static int setup_inotify_watch(const char *path) {
     if (g_inotify_wd >= 0) {
         inotify_rm_watch(g_inotify_fd, g_inotify_wd);
         g_inotify_wd = -1;
     }
     if (access(path, F_OK) == 0)
-        g_inotify_wd = inotify_add_watch(g_inotify_fd, path, IN_MODIFY);
+        g_inotify_wd = inotify_add_watch(g_inotify_fd, path,
+                                          IN_MODIFY);
     return g_inotify_wd;
 }
 
+/* 处理文件新增内容：读取增量行 → 更新 VC → UDP 发送 */
 static void process_new_lines(void) {
     if (!g_monitoring) return;
     char lines[MAX_LINES][MAX_LINE];
@@ -157,11 +168,17 @@ static void process_new_lines(void) {
 
 static void *monitor_thread(void *arg) {
     (void)arg;
-    g_inotify_fd = inotify_init();
-    if (g_inotify_fd < 0) { perror("inotify_init 失败"); return NULL; }
 
+    g_inotify_fd = inotify_init();
+    if (g_inotify_fd < 0) {
+        perror("  [错误] inotify_init() 失败");
+        return NULL;
+    }
+
+    /* 若文件已存在，立即添加监视；否则等它出现 */
     setup_inotify_watch(g_log_path);
 
+    /* 足够容纳 64 个事件的缓冲 (4096 字节，inotify 对齐) */
     char evbuf[4096]
         __attribute__((aligned(__alignof__(struct inotify_event))));
 
@@ -169,39 +186,62 @@ static void *monitor_thread(void *arg) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(g_inotify_fd, &rfds);
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
 
+        /* 1s 超时，可控退出且可定期检查文件重创 */
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         int ret = select(g_inotify_fd + 1, &rfds, NULL, NULL, &tv);
-        if (ret < 0) { if (errno == EINTR) continue; break; }
+
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            perror("  [错误] select()");
+            break;
+        }
+
         if (ret == 0) {
-            if (g_inotify_wd < 0) setup_inotify_watch(g_log_path);
+            /* 超时：若 watch 已失效且文件重新出现，重建监视 */
+            if (g_inotify_wd < 0)
+                setup_inotify_watch(g_log_path);
             continue;
         }
 
+        /* 读取 inotify 事件 */
         ssize_t len = read(g_inotify_fd, evbuf, sizeof(evbuf));
         if (len <= 0) continue;
 
         for (char *p = evbuf; p < evbuf + len; ) {
             struct inotify_event *ev = (struct inotify_event *)p;
-            if (ev->mask & (IN_IGNORED|IN_DELETE_SELF|IN_MOVE_SELF)) {
+
+            if (ev->mask & (IN_IGNORED | IN_DELETE_SELF | IN_MOVE_SELF)) {
+                /* 文件被删除/轮转/移动，watch 自动失效 */
                 g_inotify_wd = -1;
                 g_file_offset = 0;
             }
-            if (ev->mask & IN_MODIFY) process_new_lines();
+
+            if (ev->mask & IN_MODIFY)
+                process_new_lines();
+
             p += sizeof(struct inotify_event) + ev->len;
         }
     }
 
-    if (g_inotify_wd >= 0) inotify_rm_watch(g_inotify_fd, g_inotify_wd);
+    if (g_inotify_wd >= 0)
+        inotify_rm_watch(g_inotify_fd, g_inotify_wd);
     close(g_inotify_fd);
     return NULL;
 }
 
-/* --- 信号处理 --- */
+/* ==================================================================
+ * 信号处理
+ * ================================================================== */
 
-static void sig_handler(int signo) { (void)signo; g_running = 0; }
+static void sig_handler(int signo) {
+    (void)signo;
+    g_running = 0;
+}
 
-/* --- 主函数 --- */
+/* ==================================================================
+ * 主函数
+ * ================================================================== */
 
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
@@ -216,27 +256,39 @@ int main(int argc, char *argv[]) {
     g_node_id[sizeof(g_node_id)-1] = '\0';
     strncpy(g_log_path, argv[2], sizeof(g_log_path)-1);
     g_log_path[sizeof(g_log_path)-1] = '\0';
+
     const char *srv_addr = argc > 3 ? argv[3] : DEFAULT_ADDR;
     int         srv_port = argc > 4 ? atoi(argv[4]) : DEFAULT_PORT;
+
     vc_init(&g_vc);
 
+    /* 记录初始文件偏移 */
     {
         FILE *f = fopen(g_log_path, "rb");
-        if (f) { fseek(f, 0, SEEK_END); g_file_offset = ftell(f); fclose(f); }
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            g_file_offset = ftell(f);
+            fclose(f);
+        }
     }
 
+    /* 创建 UDP 套接字 */
     g_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (g_sock < 0) { perror("创建 socket 失败"); return 1; }
+    if (g_sock < 0) {
+        perror("创建 socket 失败");
+        return 1;
+    }
 
     memset(&g_server_addr, 0, sizeof(g_server_addr));
     g_server_addr.sin_family = AF_INET;
     g_server_addr.sin_port   = htons(srv_port);
     if (inet_pton(AF_INET, srv_addr, &g_server_addr.sin_addr) <= 0) {
         fprintf(stderr, "无效服务器地址: %s\n", srv_addr);
-        close(g_sock); return 1;
+        close(g_sock);
+        return 1;
     }
 
-    signal(SIGINT, sig_handler);
+    signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
     printf("========================================\n");
@@ -244,11 +296,14 @@ int main(int argc, char *argv[]) {
     printf(" 目标: %s:%d\n", srv_addr, srv_port);
     printf(" 监控: %s（inotify 事件驱动）\n", g_log_path);
     printf("========================================\n");
-    printf(" 打字→发送 | 空行→读文件 | show | exit\n\n");
+    printf(" 打字→发送 | show→查看VC | monitor→开关\n");
+    printf(" exit→退出\n\n");
 
+    /* 监控线程 */
     pthread_t monitor;
     pthread_create(&monitor, NULL, monitor_thread, NULL);
 
+    /* 交互 shell */
     char buf[MAX_LINE];
     while (g_running) {
         printf("[%s] > ", g_node_id); fflush(stdout);
@@ -256,22 +311,15 @@ int main(int argc, char *argv[]) {
         int il = (int)strlen(buf);
         while (il>0 && (buf[il-1]=='\n'||buf[il-1]=='\r')) buf[--il]=0;
 
-        if (il == 0) {
-            char lines[MAX_LINES][MAX_LINE];
-            int n = read_lines(g_log_path, MAX_LINES, lines);
-            for (int i = 0; i < n; i++) {
-                char level_buf[16] = "INFO";
-                char *raw = lines[i];
-                parse_level(raw, level_buf, sizeof(level_buf));
-                vc_increment(&g_vc, g_node_id);
-                send_line(g_node_id, level_buf, raw, &g_vc);
-                printf("  [发送][%s] %s\n", level_buf, raw);
-            }
-            if (!n) printf("  (无新行)\n");
-        } else if (strcmp(buf, "exit") == 0) break;
+        if (strcmp(buf, "exit") == 0) break;
         else if (strcmp(buf, "show") == 0) {
             printf("  vc: "); vc_print(&g_vc); printf("\n");
-        } else {
+            printf("  监控: %s  偏移: %ld\n",
+                   g_monitoring ? "开" : "关", g_file_offset);
+        } else if (strcmp(buf, "monitor") == 0) {
+            g_monitoring = !g_monitoring;
+            printf("  文件监控: %s\n", g_monitoring ? "开" : "关");
+        } else if (il > 0) {
             char level_buf[16] = "INFO";
             parse_level(buf, level_buf, sizeof(level_buf));
             vc_increment(&g_vc, g_node_id);
