@@ -3,6 +3,7 @@
  */
 #include "indexer.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -136,6 +137,60 @@ int idx_get_by_node(const InvertedIndex *idx, const char *node_id,
         }
     }
     return count;
+}
+
+/* ============ 搜索增强 ============ */
+
+int idx_search_time(const InvertedIndex *idx, const char *query,
+                    LogEntry results[], double from, double to) {
+    LogEntry tmp[MAX_ENTRIES];
+    int n = idx_search(idx, query, tmp);
+    int out = 0;
+    for (int i = 0; i < n && out < MAX_ENTRIES; i++) {
+        if (from > 0 && tmp[i].timestamp < from) continue;
+        if (to   > 0 && tmp[i].timestamp > to)   continue;
+        results[out++] = tmp[i];
+    }
+    return out;
+}
+
+int idx_search_or(const InvertedIndex *idx, const char *query,
+                  LogEntry results[]) {
+    char q_tokens[MAX_TOKENS][TOKEN_LEN];
+    int q_count = tokenize(query, q_tokens, MAX_TOKENS);
+    if (q_count == 0) return 0;
+
+    /* 对每个条目，匹配任一 token */
+    int res_count = 0;
+    for (int ei = 0; ei < idx->entry_count && res_count < MAX_ENTRIES; ei++) {
+        char msg_tokens[MAX_TOKENS][TOKEN_LEN];
+        int m_count = tokenize(idx->entries[ei].message, msg_tokens, MAX_TOKENS);
+
+        bool any_found = false;
+        for (int qi = 0; qi < q_count; qi++) {
+            for (int mi = 0; mi < m_count; mi++) {
+                if (strcmp(q_tokens[qi], msg_tokens[mi]) == 0) {
+                    any_found = true;
+                    break;
+                }
+            }
+            if (any_found) break;
+        }
+        if (any_found) results[res_count++] = idx->entries[ei];
+    }
+    return res_count;
+}
+
+static int cmp_by_time_desc(const void *a, const void *b) {
+    double ta = ((const LogEntry *)a)->timestamp;
+    double tb = ((const LogEntry *)b)->timestamp;
+    if (ta < tb) return 1;
+    if (ta > tb) return -1;
+    return 0;
+}
+
+void idx_sort_by_time(LogEntry results[], int count) {
+    qsort(results, count, sizeof(LogEntry), cmp_by_time_desc);
 }
 
 /* ============ 因果排序缓冲区 ============ */

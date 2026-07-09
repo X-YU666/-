@@ -1,19 +1,22 @@
-/* demo_all.c — 单进程演示：直接用 CausalBuffer + Indexer 跑完整流程 */
+/* demo_all.c — 单进程演示 (Linux版)
+ * 直接用 CausalBuffer + Indexer 跑完整流程，不依赖网络
+ */
 #include <stdio.h>
 #include <string.h>
 #include "vector_clock.h"
 #include "indexer.h"
 
 int main(void) {
+    setbuf(stdout, NULL);
     printf("========================================\n");
     printf("  向量时钟分布式日志聚合系统 C 语言版\n");
+    printf("  单进程演示 (无网络依赖)\n");
     printf("========================================\n\n");
-    setbuf(stdout, NULL);
 
     CausalBuffer buf; buf_init(&buf);
     InvertedIndex idx; idx_init(&idx);
 
-    /* 模拟 12 条消息乱序到达（B收到A心跳 依赖 A的第3条消息） */
+    /* 模拟 12 条消息乱序到达 */
     struct { const char *node; const char *msg; const char *cks; } msgs[] = {
         {"A", "服务器A启动",        "{\"A\":1}"},
         {"A", "处理用户请求",       "{\"A\":2}"},

@@ -1,8 +1,8 @@
 /**
- * test_e2e.c — 端到端集成测试
+ * test_e2e.c — 端到端集成测试 (Linux版)
  *
  * 模拟：Server 接收来自 ABC 三个 Agent 的日志，验证因果排序和搜索
- * 用法: gcc -o test_e2e.exe test_e2e.c vector_clock.c indexer.c -lws2_32 && ./test_e2e.exe
+ * 用法: gcc -o test_e2e test_e2e.c vector_clock.c indexer.c && ./test_e2e
  */
 #include <stdio.h>
 #include <string.h>
@@ -17,8 +17,9 @@ static int passed = 0, failed = 0;
 #define CHECK(cond) if (cond) PASS(); else FAIL(#cond)
 
 int main(void) {
+    setbuf(stdout, NULL);
     printf("\n==============================================\n");
-    printf("  项目八 · C语言版 集成测试\n");
+    printf("  项目八 · C语言版 集成测试 (Linux)\n");
     printf("==============================================\n\n");
 
     /* ---- 1. 向量时钟 ---- */
@@ -57,7 +58,7 @@ int main(void) {
         printf("[%d tokens: ", n);
         for (int i = 0; i < n; i++) printf("%s ", tokens[i]);
         printf("] ");
-        CHECK(n >= 3); /* 数据 据库 库连 连接 接超 超时 */
+        CHECK(n >= 3);
     }
 
     /* ---- 3. 倒排索引 + 搜索 ---- */
@@ -119,7 +120,6 @@ int main(void) {
         vc_init(&entries[2].vector_clock);
         vc_set(&entries[2].vector_clock, "B", 1);
 
-        /* 先发 B 的依赖 A:3 的消息（乱序） */
         strcpy(entries[3].node_id, "B");
         strcpy(entries[3].message, "B收到A心跳");
         entries[3].sequence = 3;
@@ -133,7 +133,6 @@ int main(void) {
         vc_init(&entries[4].vector_clock);
         vc_set(&entries[4].vector_clock, "A", 3);
 
-        /* 依次添加 */
         for (int i = 0; i < 5; i++) {
             LogEntry delivered[MAX_ENTRIES];
             int dc = buf_add(&buf, &entries[i], delivered);
@@ -150,7 +149,6 @@ int main(void) {
         CHECK(idx.entry_count == 5);
 
         TEST("B收到A心跳 在 A发心跳 之后");
-        /* 检查 B收到A心跳 的 vc 中 A >= 3 */
         LogEntry node_logs[MAX_NODE_LOGS];
         int nb = idx_get_by_node(&idx, "B", node_logs);
         int found = 0;
@@ -163,7 +161,6 @@ int main(void) {
         CHECK(found == 1);
     }
 
-    /* ---- 结果 ---- */
     printf("\n==============================================\n");
     printf("  结果: %d 通过, %d 失败\n", passed, failed);
     printf("==============================================\n");

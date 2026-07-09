@@ -23,6 +23,7 @@
 typedef struct {
     char        node_id[VC_NODE_ID_LEN];
     char        message[512];
+    char        level[16];
     VectorClock vector_clock;
     double      timestamp;
     int         sequence;
@@ -51,6 +52,17 @@ void idx_add(InvertedIndex *idx, const LogEntry *entry);
 /* AND 搜索：消息包含所有关键词 */
 int  idx_search(const InvertedIndex *idx, const char *query,
                 LogEntry results[]);
+
+/* AND 搜索 + 时间范围过滤 (from=0/to=0 表示不过滤) */
+int  idx_search_time(const InvertedIndex *idx, const char *query,
+                     LogEntry results[], double from, double to);
+
+/* OR 搜索：消息包含任一关键词即命中 */
+int  idx_search_or(const InvertedIndex *idx, const char *query,
+                   LogEntry results[]);
+
+/* 搜索结果按时间戳降序排列 */
+void idx_sort_by_time(LogEntry results[], int count);
 
 /* 按节点查询 */
 int  idx_get_by_node(const InvertedIndex *idx, const char *node_id,
