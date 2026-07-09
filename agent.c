@@ -1,18 +1,18 @@
 /*
  * agent.c — 日志采集代理 (Linux/UDP)
- * v2: 新增 inotify 事件驱动自动文件监控
+ * v3: 新增日志级别解析和时间戳字段
  *
  * 改动：
- *   - 新增 monitor_thread: inotify + select() 阻塞等待
- *   - 新增信号处理 (SIGINT/SIGTERM)
- *   - 新增 pthread_mutex 保护 UDP 发送
- *   - 保留空行 Enter 手动读文件作为后备
+ *   - 新增 parse_level()：自动提取行首 [INFO]/[WARN]/[ERROR]
+ *   - JSON 扩展为 5 字段：node_id / timestamp / level / message / vector_clock
+ *   - 自动监控和手动模式共享同一套增强的 JSON 输出
  *
  * 用法: ./agent <A|B|C> <日志文件> [服务器IP] [端口]
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/inotify.h>
@@ -41,22 +41,58 @@ static volatile int g_running    = 1;
 static volatile int g_monitoring = 1;
 static pthread_mutex_t g_send_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* --- UDP 发送 --- */
+/* --- 日志级别解析 --- */
 
-static int send_line(const char *node, const char *msg,
-                     const VectorClock *vc) {
+static const char *parse_level(char *line, char *level_out, int level_sz) {
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (*p == '[') {
+        p++;
+        char buf[16];
+        int i = 0;
+        while (*p && *p != ']' && i < (int)sizeof(buf) - 1)
+            buf[i++] = *p++;
+        if (*p == ']' && i > 0) {
+            buf[i] = '\0';
+            if (strcmp(buf, "INFO") == 0 || strcmp(buf, "WARN") == 0
+                || strcmp(buf, "ERROR") == 0) {
+                strncpy(level_out, buf, level_sz - 1);
+                level_out[level_sz - 1] = '\0';
+                p++;
+                while (*p == ' ') p++;
+                if (*p == '[') {
+                    while (*p && *p != ']') p++;
+                    if (*p == ']') p++;
+                }
+                while (*p == ' ') p++;
+                int remaining = (int)strlen(p);
+                memmove(line, p, remaining + 1);
+                return level_out;
+            }
+        }
+    }
+    strncpy(level_out, "INFO", level_sz - 1);
+    return level_out;
+}
+
+/* --- UDP 发送（5 字段 JSON） --- */
+
+static int send_line(const char *node, const char *level,
+                     const char *msg, const VectorClock *vc) {
     char json[MAX_JSON], vj[256];
     vc_to_json(vc, vj, sizeof(vj));
+    time_t ts = time(NULL);
     int n = snprintf(json, sizeof(json),
-        "{\"node_id\":\"%s\",\"message\":\"%s\",\"vector_clock\":%s}\n",
-        node, msg, vj);
+        "{\"node_id\":\"%s\",\"timestamp\":%lld,\"level\":\"%s\","
+        "\"message\":\"%s\",\"vector_clock\":%s}\n",
+        node, (long long)ts, level, msg, vj);
 
     pthread_mutex_lock(&g_send_mutex);
     ssize_t sent = sendto(g_sock, json, (size_t)n, 0,
                           (struct sockaddr *)&g_server_addr,
                           sizeof(g_server_addr));
     pthread_mutex_unlock(&g_send_mutex);
-
     if (sent < 0) { perror("  [错误] UDP 发送失败"); return 0; }
     return 1;
 }
@@ -109,9 +145,12 @@ static void process_new_lines(void) {
     char lines[MAX_LINES][MAX_LINE];
     int n = read_lines(g_log_path, MAX_LINES, lines);
     for (int i = 0; i < n; i++) {
+        char level_buf[16] = "INFO";
+        char *raw = lines[i];
+        parse_level(raw, level_buf, sizeof(level_buf));
         vc_increment(&g_vc, g_node_id);
-        send_line(g_node_id, lines[i], &g_vc);
-        printf("\n  [自动] %s\n", lines[i]);
+        send_line(g_node_id, level_buf, raw, &g_vc);
+        printf("\n  [自动][%s][%s] %s\n", g_node_id, level_buf, raw);
         printf("[%s] > ", g_node_id); fflush(stdout);
     }
 }
@@ -218,22 +257,26 @@ int main(int argc, char *argv[]) {
         while (il>0 && (buf[il-1]=='\n'||buf[il-1]=='\r')) buf[--il]=0;
 
         if (il == 0) {
-            /* 保留空行手动模式作为后备 */
             char lines[MAX_LINES][MAX_LINE];
             int n = read_lines(g_log_path, MAX_LINES, lines);
             for (int i = 0; i < n; i++) {
+                char level_buf[16] = "INFO";
+                char *raw = lines[i];
+                parse_level(raw, level_buf, sizeof(level_buf));
                 vc_increment(&g_vc, g_node_id);
-                send_line(g_node_id, lines[i], &g_vc);
-                printf("  [发送] %s\n", lines[i]);
+                send_line(g_node_id, level_buf, raw, &g_vc);
+                printf("  [发送][%s] %s\n", level_buf, raw);
             }
             if (!n) printf("  (无新行)\n");
         } else if (strcmp(buf, "exit") == 0) break;
         else if (strcmp(buf, "show") == 0) {
             printf("  vc: "); vc_print(&g_vc); printf("\n");
         } else {
+            char level_buf[16] = "INFO";
+            parse_level(buf, level_buf, sizeof(level_buf));
             vc_increment(&g_vc, g_node_id);
-            if (send_line(g_node_id, buf, &g_vc))
-                printf("  [发送] %s\n", buf);
+            send_line(g_node_id, level_buf, buf, &g_vc);
+            printf("  [发送][%s] %s\n", level_buf, buf);
         }
     }
 
