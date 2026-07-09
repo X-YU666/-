@@ -1,7 +1,5 @@
 /*
- * server.c v9 — 新增：启动帮助界面
- * 开机直接打印所有命令用法示例
- * 用法: server.exe [管道名]
+ * server.c v9 — 新增：help 命令增强，完整显示所有命令示例
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +34,7 @@ static DWORD WINAPI pa(LPVOID a){PipeAcceptCtx*ac=(PipeAcceptCtx*)a;while(g_runn
 static void ln(const char*id){int cnt=0;for(int i=0;i<g_idx.entry_count;i++){if(strcmp(g_idx.entries[i].node_id,id)==0){printf("  [%s] %s\n",g_idx.entries[i].level,g_idx.entries[i].message);cnt++;}}if(cnt==0)printf("  (无节点 %s 的日志)\n",id);}
 static void cmd(const char*c){
     if(strcmp(c,"exit")==0){li("exit 命令");InterlockedExchange(&g_running,0);return;}
-    if(strcmp(c,"help")==0){printf("  search <词>            — 全文检索\n  search <词> --node A   — 只看节点 A\n  search <词> --from 2026-07-01 --to 2026-07-06  — 日期范围\n  search <词> --from 2026-07-06 14:00:00 --to ... — 精确时间\n  search --or 超时 失败  — OR 匹配\n  list / list A / count / errors / exit\n");return;}
+    if(strcmp(c,"help")==0){printf("  search <词>               — 全文检索\n  search <词> --node A      — 只看节点 A\n  search <词> --from 2026-07-01 --to 2026-07-06\n                           — 限定日期范围\n  search <词> --from 2026-07-06 14:00:00 --to ...\n                           — 精确到分钟\n  search --or 超时 失败     — OR 匹配\n  list / list A / count / errors / exit\n");return;}
     if(strcmp(c,"errors")==0){printf("  错误次数: %d\n",g_error_count);return;}
     if(strcmp(c,"count")==0){printf("  已交付: %d  缓冲: %d/%d  错误: %d\n",g_idx.entry_count,g_buf.buf_count,MAX_ENTRIES,g_error_count);return;}
     if(strcmp(c,"list")==0){if(g_idx.entry_count==0){printf("  (暂无)\n");return;}for(int i=0;i<g_idx.entry_count;i++)printf("  [%s][%s] %s\n",g_idx.entries[i].node_id,g_idx.entries[i].level,g_idx.entries[i].message);return;}
@@ -68,9 +66,7 @@ int main(int argc,char*argv[]){setbuf(stdout,NULL);SetConsoleOutputCP(65001);Set
     idx_init(&g_idx);buf_init(&g_buf);li("索引初始化完成");
     g_pf=fopen(PERSIST_PATH,"a");if(!g_pf)le("无法打开持久化文件");else li("持久化文件: %s",PERSIST_PATH);lp();
     printf("+------------------------------------------+\n| 向量时钟分布式日志聚合服务器 v9           |\n+------------------------------------------+\n");li("管道: %s",pn);
-    /* 启动帮助界面 */
-    printf("命令用法:\n  search <词>               — 全文检索\n  search <词> --node A      — 只看节点 A\n  search <词> --from 2026-07-01 --to 2026-07-06\n  search <词> --from \"2026-07-06 14:00:00\" ...\n  search --or 超时 失败     — OR 匹配\n  list / list A / count / errors / exit\n------------------------------------------------\n");
-    printf("等待 Agent 连接...\n\n[server] > ");fflush(stdout);
+    printf("命令用法:\n  search <词>               — 全文检索\n  search <词> --node A      — 只看节点 A\n  search <词> --from 2026-07-01 --to 2026-07-06\n                           — 限定日期范围\n  search <词> --from 2026-07-06 14:00:00 --to 2026-07-06 15:30:00\n                           — 精确到分钟\n  search --or 超时 失败     — OR 匹配\n  list / list A / count / errors / exit\n------------------------------------------------\n");printf("等待 Agent 连接...\n\n[server] > ");fflush(stdout);
     PipeAcceptCtx ac={pn};HANDLE hpt=CreateThread(NULL,0,pa,&ac,0,NULL);
     while(g_running){printf("[server] > ");fflush(stdout);char inp[512];if(!fgets(inp,sizeof(inp),stdin))break;int len=(int)strlen(inp);while(len>0&&(inp[len-1]=='\n'||inp[len-1]=='\r'))inp[--len]=0;if(len>0){const char*t=inp;while(*t==' '||*t=='\t')t++;if(*t)cmd(t);}}
     if(g_pf)fclose(g_pf);li("关闭完毕: 交付 %d 条, 残留 %d 条, 错误 %d 次",g_idx.entry_count,g_buf.buf_count,g_error_count);WaitForSingleObject(hpt,3000);return 0;
