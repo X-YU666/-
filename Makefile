@@ -1,47 +1,59 @@
-# Makefile — 向量时钟分布式日志聚合系统 (C语言版)
-# 编译器: gcc (MinGW / Linux)
-# 用法: make          → 编译全部
-#       make test_vc  → 编译并运行向量时钟测试
-#       make clean    → 清理
+# Makefile — 向量时钟分布式日志聚合 (Linux/UDP 版)
+# 用法:
+#   make             编译全部（agent + server + log_gen + 测试）
+#   make demo        单进程无网络演示
+#   make test        集成测试
+#   make test_vc     向量时钟单元测试
+#   make clean       清理
+#
+# 多进程运行:
+#   终端1: ./server
+#   终端2: ./agent A logs_A.txt
+#   终端3: ./log_gen logs_A.txt
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -std=c17 -O2
-LDFLAGS = -lws2_32   # Windows Winsock (Linux 移除这行)
+LDFLAGS = -lpthread
 
 SRC = vector_clock.c indexer.c
 HDR = vector_clock.h indexer.h
 
-.PHONY: all clean test_vc test_indexer demo
+.PHONY: all clean test test_vc demo
 
-all: agent.exe server.exe
+all: agent server log_gen test_e2e demo_all
 
-# ---- 向量时钟测试 ----
-test_vc.exe: vector_clock.c
-	$(CC) $(CFLAGS) -DVECTOR_CLOCK_TEST -o test_vc.exe vector_clock.c
-test_vc: test_vc.exe
-	./test_vc.exe
+# ============ 主程序 ============
 
-# ---- 倒排索引测试 ----
-test_indexer.exe: indexer.c vector_clock.c
-	$(CC) $(CFLAGS) -DINDEXER_TEST -o test_indexer.exe indexer.c vector_clock.c $(LDFLAGS)
-test_indexer: test_indexer.exe
-	./test_indexer.exe
+agent: agent.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ agent.c $(SRC) $(LDFLAGS)
 
-# ---- Agent ----
-agent.exe: agent.c $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -o agent.exe agent.c $(SRC) $(LDFLAGS)
+server: server.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ server.c $(SRC) $(LDFLAGS)
 
-# ---- Server ----
-server.exe: server.c $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -o server.exe server.c $(SRC) $(LDFLAGS)
+log_gen: log_gen.c
+	$(CC) $(CFLAGS) -o $@ log_gen.c
 
-# ---- Demo: 启动所有窗口 ----
-demo: agent.exe server.exe
-	@echo "请手动运行:"
-	@echo "  窗口1: server.exe"
-	@echo "  窗口2: agent.exe A logs_A.txt"
-	@echo "  窗口3: agent.exe B logs_B.txt"
-	@echo "  窗口4: agent.exe C logs_C.txt"
+# ============ 测试 / 演示 ============
+
+test_e2e: test_e2e.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ test_e2e.c $(SRC)
+
+demo_all: demo_all.c $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -o $@ demo_all.c $(SRC)
+
+test: test_e2e
+	./test_e2e
+
+demo: demo_all
+	./demo_all
+
+# ============ 向量时钟单元测试 ============
+
+test_vc: vector_clock.c
+	$(CC) $(CFLAGS) -DVECTOR_CLOCK_TEST -o $@ vector_clock.c
+	./test_vc
+
+# ============ 清理 ============
 
 clean:
-	del /f /q *.exe *.o 2>nul || rm -f *.exe *.o
+	rm -f agent server log_gen test_e2e demo_all test_vc *.o
