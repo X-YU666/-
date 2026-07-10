@@ -1,6 +1,12 @@
 /*
- * agent.c — 日志采集代理 (Linux/UDP) — 最终版
- * v4: 移除手动 Enter 模式，新增 monitor 开关
+ * agent.c — 日志采集代理 (Linux/UDP)
+ *
+ * 负责的工作：
+ *   1. 用 inotify 监控日志文件变化（事件驱动，不是轮询）
+ *   2. 有新内容就增量读取（记偏移量，不重复读）
+ *   3. 解析日志级别 [INFO]/[WARN]/[ERROR]
+ *   4. 自增向量时钟、打包成 JSON、UDP 发送到服务器
+ *   5. 接收服务器回传的全局时钟，合并到自己 VC 里
  *
  * 用法: ./agent <A|B|C> <日志文件> [服务器IP] [端口]
  * 默认: 127.0.0.1:9876
@@ -21,26 +27,34 @@
 #include <fcntl.h>
 #include "vector_clock.h"
 
-#define MAX_LINE   1024
-#define MAX_JSON   2048
-#define MAX_LINES  100
+#define MAX_LINE   1024      /* 单行日志最大长度 */
+#define MAX_JSON   2048      /* 封装后的 JSON 最大长度 */
+#define MAX_LINES  100       /* 一次最多读 100 行 */
 #define DEFAULT_PORT 9876
 #define DEFAULT_ADDR "127.0.0.1"
 
-static VectorClock g_vc;
-static char        g_node_id[16];
-static char        g_log_path[260];
-static long        g_file_offset = 0;
-static int         g_sock = -1;
-static struct sockaddr_in g_server_addr;
+/* ===================== 全局变量 ===================== */
+
+static VectorClock g_vc;            /* 本地的向量时钟 */
+static char        g_node_id[16];   /* 自己的节点名（A/B/C） */
+static char        g_log_path[260]; /* 被监控的日志文件路径 */
+static long        g_file_offset = 0;   /* 已读到文件哪了（增量用） */
+static int         g_sock = -1;         /* UDP 套接字 */
+static struct sockaddr_in g_server_addr; /* 服务器地址 */
 static volatile int g_running    = 1;
-static volatile int g_monitoring = 1;
+static volatile int g_monitoring = 1;    /* 是否开启文件监控 */
+
+/* 线程锁：发送锁防止多个线程同时写 socket 导致数据串位 */
 static pthread_mutex_t g_send_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* VC 锁：发送线程和接收线程可能同时读写 g_vc */
+static pthread_mutex_t g_vc_mutex   = PTHREAD_MUTEX_INITIALIZER;
 
 /* ==================================================================
- * 日志行解析：从行首提取 [INFO]/[WARN]/[ERROR] 并透传到 level 字段
+ * 日志级别提取：从行首找 [INFO]/[WARN]/[ERROR]
+ *
+ * 比如 "[ERROR] 数据库连接超时" → 取出 "ERROR"，消息体变成"数据库连接超时"
+ * 没有级别标记的默认当 INFO
  * ================================================================== */
-
 static const char *parse_level(char *line, char *level_out, int level_sz) {
     const char *p = line;
     while (*p == ' ' || *p == '\t') p++;
@@ -75,9 +89,13 @@ static const char *parse_level(char *line, char *level_out, int level_sz) {
 }
 
 /* ==================================================================
- * UDP 发送
+ * UDP 发送：把一条日志打成 JSON 发到服务器
+ *
+ * JSON 格式：
+ * {"node_id":"A","timestamp":... ,"level":"ERROR","message":"...","vector_clock":{"A":3}}
+ *
+ * 用 sendto 发 UDP，自带线程锁防止多个线程同时写 socket
  * ================================================================== */
-
 static int send_line(const char *node, const char *level,
                      const char *msg, const VectorClock *vc) {
     char json[MAX_JSON], vj[256];
@@ -103,8 +121,12 @@ static int send_line(const char *node, const char *level,
 
 /* ==================================================================
  * 增量读取日志文件
+ *
+ * 原理：每次打开文件，fseek 到上次读到的位置（g_file_offset），
+ * 只读新增的部分。读完更新偏移量。
+ *
+ * 如果文件变短了（被轮转/截断），就把偏移量重置为 0 从头读
  * ================================================================== */
-
 static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
@@ -133,10 +155,14 @@ static int read_lines(const char *path, int maxl, char (*lines)[MAX_LINE]) {
 
 /* ==================================================================
  * 文件监控线程 (inotify — Linux 事件驱动文件监听)
+ *
+ * 原理：不是死循环去"看一眼文件变没"，而是让内核通知我们"文件变了"。
+ * 内核在文件有 IN_MODIFY 事件时告诉 agent，agent 才去读新内容。
+ * CPU 几乎为零开销。
  * ================================================================== */
 
 static int g_inotify_fd = -1;
-static int g_inotify_wd  = -1;
+static int g_inotify_wd  = -1;  /* watch 描述符，-1 表示失效 */
 
 /* 添加/更新 inotify 监视 */
 static int setup_inotify_watch(const char *path) {
@@ -150,7 +176,10 @@ static int setup_inotify_watch(const char *path) {
     return g_inotify_wd;
 }
 
-/* 处理文件新增内容：读取增量行 → 更新 VC → UDP 发送 */
+/* 处理文件新增内容：读取增量行 → 更新 VC → UDP 发送
+ *
+ * 注意：vc_increment 需要加锁，因为接收线程可能同时在改 g_vc
+ */
 static void process_new_lines(void) {
     if (!g_monitoring) return;
     char lines[MAX_LINES][MAX_LINE];
@@ -159,13 +188,17 @@ static void process_new_lines(void) {
         char level_buf[16] = "INFO";
         char *raw = lines[i];
         parse_level(raw, level_buf, sizeof(level_buf));
+        /* 自增时要锁 VC，防止和 recv_sync_thread 冲突 */
+        pthread_mutex_lock(&g_vc_mutex);
         vc_increment(&g_vc, g_node_id);
+        pthread_mutex_unlock(&g_vc_mutex);
         send_line(g_node_id, level_buf, raw, &g_vc);
         printf("\n  [自动][%s][%s] %s\n", g_node_id, level_buf, raw);
         printf("[%s] > ", g_node_id); fflush(stdout);
     }
 }
 
+/* 监控线程主体：等待 inotify 事件 → 读文件 → 发 UDP */
 static void *monitor_thread(void *arg) {
     (void)arg;
 
@@ -231,9 +264,48 @@ static void *monitor_thread(void *arg) {
 }
 
 /* ==================================================================
- * 信号处理
+ * 服务器反馈接收线程
+ *
+ * 作用：收到服务器回传的全局时钟后，合并到自己的 VC 里
+ *
+ * 原理：服务器每次处理完一条日志，会往 agent 的地址发一个包：
+ *   {"type":"vc_sync","max_vc":{"A":3,"B":2,"C":1}}
+ * 这个线程收到后，调用 vc_merge 把全局状态合并进来。
+ * 这样下次发日志时 VC 就带上了其他节点的信息（比如 {A:4, B:2, C:1}）。
  * ================================================================== */
+static void *recv_sync_thread(void *arg) {
+    (void)arg;
+    char pkt[MAX_JSON];
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
 
+    while (g_running) {
+        int n = (int)recvfrom(g_sock, pkt, sizeof(pkt) - 1, 0,
+                              (struct sockaddr *)&from, &from_len);
+        if (n <= 0) continue;
+        pkt[n] = '\0';
+
+        /* 查找 "max_vc":{...} 字段 */
+        char *vp = strstr(pkt, "\"max_vc\":");
+        if (!vp) continue;
+        vp += 9; /* 跳过 "max_vc": */
+
+        VectorClock svc;
+        if (!vc_from_json(&svc, vp)) continue;
+
+        /* 合并全局时钟到本地 VC（要加锁，防止和发送线程冲突） */
+        pthread_mutex_lock(&g_vc_mutex);
+        VectorClock merged;
+        vc_merge(&merged, &g_vc, &svc);
+        g_vc = merged;
+        pthread_mutex_unlock(&g_vc_mutex);
+    }
+    return NULL;
+}
+
+/* ==================================================================
+ * 信号处理：按 Ctrl+C 时优雅退出
+ * ================================================================== */
 static void sig_handler(int signo) {
     (void)signo;
     g_running = 0;
@@ -241,8 +313,15 @@ static void sig_handler(int signo) {
 
 /* ==================================================================
  * 主函数
+ *
+ * 启动流程：
+ *   1. 解析命令行参数（节点名、日志文件路径、服务器IP、端口）
+ *   2. 初始化向量时钟，记录文件初始偏移
+ *   3. 创建 UDP socket → bind（这样才能收服务器回传）
+ *   4. 启动监控线程（inotify 监听文件变化）
+ *   5. 启动接收线程（收服务器回传的全局时钟）
+ *   6. 进入交互 Shell（打字发送 / show 看 VC / monitor 开关监控）
  * ================================================================== */
-
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
 
@@ -262,7 +341,7 @@ int main(int argc, char *argv[]) {
 
     vc_init(&g_vc);
 
-    /* 记录初始文件偏移 */
+    /* 记录初始文件偏移：启动时不读已有内容，只读新增 */
     {
         FILE *f = fopen(g_log_path, "rb");
         if (f) {
@@ -288,6 +367,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* 绑定本地端口以便接收服务器反馈 */
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    local_addr.sin_port = htons(0); /* 系统自动分配端口 */
+    if (bind(g_sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        perror("绑定本地端口失败");
+        close(g_sock);
+        return 1;
+    }
+
     signal(SIGINT,  sig_handler);
     signal(SIGTERM, sig_handler);
 
@@ -299,11 +390,15 @@ int main(int argc, char *argv[]) {
     printf(" 打字→发送 | show→查看VC | monitor→开关\n");
     printf(" exit→退出\n\n");
 
-    /* 监控线程 */
+    /* 启动监控线程（文件变化监听） */
     pthread_t monitor;
     pthread_create(&monitor, NULL, monitor_thread, NULL);
 
-    /* 交互 shell */
+    /* 启动接收线程（收服务器回传的全局时钟） */
+    pthread_t sync_thread;
+    pthread_create(&sync_thread, NULL, recv_sync_thread, NULL);
+
+    /* 交互 Shell */
     char buf[MAX_LINE];
     while (g_running) {
         printf("[%s] > ", g_node_id); fflush(stdout);
@@ -313,22 +408,29 @@ int main(int argc, char *argv[]) {
 
         if (strcmp(buf, "exit") == 0) break;
         else if (strcmp(buf, "show") == 0) {
+            /* 读 VC 要加锁 */
+            pthread_mutex_lock(&g_vc_mutex);
             printf("  vc: "); vc_print(&g_vc); printf("\n");
+            pthread_mutex_unlock(&g_vc_mutex);
             printf("  监控: %s  偏移: %ld\n",
                    g_monitoring ? "开" : "关", g_file_offset);
         } else if (strcmp(buf, "monitor") == 0) {
             g_monitoring = !g_monitoring;
             printf("  文件监控: %s\n", g_monitoring ? "开" : "关");
         } else if (il > 0) {
+            /* 手动输入一条日志发送 */
             char level_buf[16] = "INFO";
             parse_level(buf, level_buf, sizeof(level_buf));
+            pthread_mutex_lock(&g_vc_mutex);
             vc_increment(&g_vc, g_node_id);
+            pthread_mutex_unlock(&g_vc_mutex);
             send_line(g_node_id, level_buf, buf, &g_vc);
             printf("  [发送][%s] %s\n", level_buf, buf);
         }
     }
 
     g_running = 0;
+    pthread_join(sync_thread, NULL);
     pthread_join(monitor, NULL);
     if (g_sock >= 0) close(g_sock);
     printf("[%s] 已退出\n", g_node_id);
