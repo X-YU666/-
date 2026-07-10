@@ -1,14 +1,28 @@
 /*
  * vector_clock.c — 向量时钟实现
+ *
+ * 大白话说明：
+ * 向量时钟不是"几点几分"的物理时间，而是每个节点记"我知道各节点都到第几件事了"。
+ * 比如 {A:3, B:2} 表示"我知道A发生过3个事件、B发生过2个事件"。
+ * 每条日志附带上发送时刻的向量时钟，接收方就能判断"这条日志发生时，我知道到什么程度了"。
+ * 比较两个时钟就能知道"谁先谁后"还是"他俩同时发生的、互不知道"。
  */
+
 #include "vector_clock.h"
 #include <stdio.h>
 #include <string.h>
 
+/* ================================================================
+ * 初始化时钟：清零分量列表，相当于一张白纸
+ * ================================================================ */
 void vc_init(VectorClock *vc) {
     vc->count = 0;
 }
 
+/* ================================================================
+ * 查分量：问"A在这个时钟里记到几了？"
+ * 如果 A 不存在（比如还没听说过A），返回 0
+ * ================================================================ */
 int vc_get(const VectorClock *vc, const char *node_id) {
     for (int i = 0; i < vc->count; i++) {
         if (strcmp(vc->comps[i].node_id, node_id) == 0)
@@ -17,6 +31,11 @@ int vc_get(const VectorClock *vc, const char *node_id) {
     return 0;
 }
 
+/* ================================================================
+ * 设分量：把某个节点的计数器设成指定值
+ * 如果已存在就改值，不存在就在列表末尾新增一条
+ * 上限 8 个节点（VC_MAX_NODES），超过就不存了
+ * ================================================================ */
 void vc_set(VectorClock *vc, const char *node_id, int value) {
     for (int i = 0; i < vc->count; i++) {
         if (strcmp(vc->comps[i].node_id, node_id) == 0) {
@@ -33,11 +52,24 @@ void vc_set(VectorClock *vc, const char *node_id, int value) {
     }
 }
 
+/* ================================================================
+ * 自增：自己节点产生了新事件，计数器+1
+ * 比如 A 写了条日志到文件 → A 的分量从 2 变成 3
+ * ================================================================ */
 void vc_increment(VectorClock *vc, const char *own_node) {
     int val = vc_get(vc, own_node);
     vc_set(vc, own_node, val + 1);
 }
 
+/* ================================================================
+ * 合并：取 a 和 b 的逐分量最大值，写到 dst
+ *
+ * 场景：我手里有我的时钟（{A:3}），收到了别人带来的时钟（{B:2}）
+ * 合并后就是 {A:3, B:2} —— 我知道的 A 保持 3，原来不知道 B 现在知道了
+ *
+ * 规则：遍历 a 所有分量，跟 b 的同分量比大小取大的；
+ *       再遍历 b 中 a 没有的分量，直接加进来
+ * ================================================================ */
 void vc_merge(VectorClock *dst, const VectorClock *a, const VectorClock *b) {
     vc_init(dst);
     /* 遍历 a */
@@ -53,6 +85,13 @@ void vc_merge(VectorClock *dst, const VectorClock *a, const VectorClock *b) {
     }
 }
 
+/* ================================================================
+ * 接收消息时的标准流程：先合并再自增
+ *
+ * 顺序不能反：
+ *   ❌ 先自增再合并 → 还没看别人的信就先说自己知道了，逻辑不通
+ *   ✅ 先合并再自增 → 先"补课"别人知道的事，再加自己的新事件
+ * ================================================================ */
 void vc_receive(VectorClock *vc, const VectorClock *incoming, const char *own_node) {
     VectorClock merged;
     vc_merge(&merged, vc, incoming);
@@ -60,10 +99,23 @@ void vc_receive(VectorClock *vc, const VectorClock *incoming, const char *own_no
     vc_increment(vc, own_node);
 }
 
+/* ================================================================
+ * 比较两个时钟的因果顺序 —— 整个系统最核心的函数
+ *
+ * 返回四种结果：
+ *   BEFORE      → a 发生在 b 之前（a 的所有分量 ≤ b，且至少一个 <）
+ *   AFTER       → a 发生在 b 之后（反过来）
+ *   CONCURRENT  → 并发，分不清先后（既有 a > b 的分量，又有 a < b 的分量）
+ *   EQUAL       → 完全相等
+ *
+ * ⚠️ 踩过的坑：最初只遍历了 a 的分量，漏掉了 b 独有而 a 没有的节点。
+ *    修复方案：先把 a 和 b 的所有节点名收集到 all_nodes 里，
+ *    再逐节点比较，不存在的视为 0。这样就不会漏了。
+ * ================================================================ */
 VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
     bool a_le_b = true, b_le_a = true;
 
-    /* 收集所有节点 */
+    /* ---- 第 1 步：收集 a 和 b 所有出现过的节点 ---- */
     char all_nodes[VC_MAX_NODES][VC_NODE_ID_LEN];
     int all_count = 0;
     for (int i = 0; i < a->count; i++) {
@@ -84,6 +136,7 @@ VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
         }
     }
 
+    /* ---- 第 2 步：逐节点比较 ---- */
     for (int i = 0; i < all_count; i++) {
         int va = vc_get(a, all_nodes[i]);
         int vb = vc_get(b, all_nodes[i]);
@@ -91,12 +144,14 @@ VCOrder vc_compare(const VectorClock *a, const VectorClock *b) {
         if (vb > va) b_le_a = false;
     }
 
+    /* ---- 第 3 步：根据比较结果返回状态 ---- */
     if (a_le_b && b_le_a) return VC_EQUAL;
     if (a_le_b)          return VC_BEFORE;
     if (b_le_a)          return VC_AFTER;
     return VC_CONCURRENT;
 }
 
+/* 把枚举状态转成人类可读的字符串 */
 const char *vc_order_str(VCOrder o) {
     switch (o) {
         case VC_BEFORE:     return "before";
@@ -107,6 +162,10 @@ const char *vc_order_str(VCOrder o) {
     }
 }
 
+/* ================================================================
+ * 序列化：把向量时钟打成 JSON 字符串
+ * 例如 {A:3, B:2} → {"A":3,"B":2}
+ * ================================================================ */
 int vc_to_json(const VectorClock *vc, char *buf, int buf_size) {
     int pos = 0;
     pos += snprintf(buf + pos, buf_size - pos, "{");
@@ -119,6 +178,11 @@ int vc_to_json(const VectorClock *vc, char *buf, int buf_size) {
     return pos;
 }
 
+/* ================================================================
+ * 反序列化：从 JSON 字符串解析出向量时钟
+ * 自己手写的轻量解析器，不做通用 JSON 解析
+ * 解析规则：跳过 { → 读 "key" → 跳过 : → 读数字 → 循环直到 }
+ * ================================================================ */
 bool vc_from_json(VectorClock *vc, const char *json) {
     vc_init(vc);
     const char *p = json;
@@ -159,6 +223,7 @@ bool vc_from_json(VectorClock *vc, const char *json) {
     return true;
 }
 
+/* 调试打印 */
 void vc_print(const VectorClock *vc) {
     char buf[256];
     vc_to_json(vc, buf, sizeof(buf));
